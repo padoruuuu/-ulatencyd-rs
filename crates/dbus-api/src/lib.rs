@@ -14,6 +14,39 @@ use zbus::{interface, SignalContext};
 use psi::SystemPressure;
 
 // ---------------------------------------------------------------------------
+// Polkit helper
+// ---------------------------------------------------------------------------
+
+/// Check a polkit action for the caller identified by `sender`.
+/// Returns Ok(true) if authorized, Ok(false) if denied, Err on comms failure.
+async fn polkit_check(
+    conn:      &zbus::Connection,
+    sender:    &str,
+    action_id: &str,
+) -> Result<bool, zbus::Error> {
+    // org.freedesktop.PolicyKit1.Authority.CheckAuthorization
+    let proxy = zbus::Proxy::new(
+        conn,
+        "org.freedesktop.PolicyKit1",
+        "/org/freedesktop/PolicyKit1/Authority",
+        "org.freedesktop.PolicyKit1.Authority",
+    ).await?;
+
+    // Subject: ("system-bus-name", {"name": sender})
+    let mut subject_details: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
+    subject_details.insert("name", zbus::zvariant::Value::new(sender));
+    let subject = ("system-bus-name", subject_details);
+
+    // flags=0 (no interaction), cancellation_id=""
+    let result: (bool, bool, HashMap<String, String>) = proxy
+        .call("CheckAuthorization", &(subject, action_id, HashMap::<&str, &str>::new(), 0u32, ""))
+        .await?;
+
+    // result.0 = is_authorized
+    Ok(result.0)
+}
+
+// ---------------------------------------------------------------------------
 // Shared daemon state visible to the D-Bus layer
 // ---------------------------------------------------------------------------
 
@@ -112,14 +145,36 @@ impl UlatencydInterface {
         m
     }
 
-    async fn reload_rules(&self) -> bool {
+    async fn reload_rules(
+        &self,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> bool {
+        let sender = hdr.sender().map(|s| s.to_string()).unwrap_or_default();
+        match polkit_check(conn, &sender, "rs.ulatencyd.reload-rules").await {
+            Ok(true) => {}
+            Ok(false) => { warn!("polkit denied reload-rules for {}", sender); return false; }
+            Err(e)   => { warn!("polkit error: {}", e); return false; }
+        }
         match self.cmd_tx.send(DbusCommand::ReloadRules).await {
             Ok(_) => true,
             Err(e) => { warn!("reload_rules: send error: {}", e); false }
         }
     }
 
-    async fn set_process_cgroup(&self, pid: u32, cgroup: String) -> bool {
+    async fn set_process_cgroup(
+        &self,
+        pid: u32,
+        cgroup: String,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> bool {
+        let sender = hdr.sender().map(|s| s.to_string()).unwrap_or_default();
+        match polkit_check(conn, &sender, "rs.ulatencyd.set-cgroup").await {
+            Ok(true) => {}
+            Ok(false) => { warn!("polkit denied set-cgroup for {}", sender); return false; }
+            Err(e)   => { warn!("polkit error: {}", e); return false; }
+        }
         match self.cmd_tx.send(DbusCommand::SetProcessCgroup { pid, cgroup }).await {
             Ok(_) => true,
             Err(e) => { warn!("set_process_cgroup: send error: {}", e); false }
@@ -127,7 +182,18 @@ impl UlatencydInterface {
     }
 
     /// Called by compositors/WMs when focus changes (system76-scheduler compat).
-    async fn set_foreground_process(&self, pid: u32) {
+    async fn set_foreground_process(
+        &self,
+        pid: u32,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) {
+        let sender = hdr.sender().map(|s| s.to_string()).unwrap_or_default();
+        match polkit_check(conn, &sender, "rs.ulatencyd.set-foreground").await {
+            Ok(true) => {}
+            Ok(false) => { warn!("polkit denied set-foreground for {}", sender); return; }
+            Err(e)   => { warn!("polkit error (allowing anyway): {}", e); }
+        }
         info!("D-Bus: SetForegroundProcess({})", pid);
         let _ = self.cmd_tx.send(DbusCommand::SetForegroundProcess(pid)).await;
     }

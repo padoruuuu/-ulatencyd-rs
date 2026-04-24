@@ -1,21 +1,22 @@
-PREFIX    ?= /usr
-DESTDIR   ?=
-BINDIR     = $(DESTDIR)$(PREFIX)/sbin
-USRBIN     = $(DESTDIR)$(PREFIX)/bin
-RULESDIR   = $(DESTDIR)$(PREFIX)/lib/ulatencyd/rules
-CONFDIR    = $(DESTDIR)/etc/ulatencyd
-DBUSDIR    = $(DESTDIR)/etc/dbus-1/system.d
-SYSTEMDDIR = $(DESTDIR)/lib/systemd/system
+PREFIX     ?= /usr
+DESTDIR    ?=
+BINDIR      = $(DESTDIR)$(PREFIX)/sbin
+USRBIN      = $(DESTDIR)$(PREFIX)/bin
+RULESDIR    = $(DESTDIR)$(PREFIX)/lib/ulatencyd/rules
+CONFDIR     = $(DESTDIR)/etc/ulatencyd
+POLKITACTS  = $(DESTDIR)$(PREFIX)/share/polkit-1/actions
+POLKITRULES = $(DESTDIR)$(PREFIX)/share/polkit-1/rules.d
+SYSTEMDDIR  = $(DESTDIR)/lib/systemd/system
 
 CARGO_FLAGS ?= --release
 SRCDIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
-.PHONY: build install install-rules install-config install-dbus uninstall clean
+.PHONY: build install install-rules install-config install-polkit uninstall clean
 
 build:
 	cd $(SRCDIR) && cargo build $(CARGO_FLAGS)
 
-install: install-rules install-config install-dbus
+install: install-rules install-config install-polkit
 	install -Dm755 $(SRCDIR)target/release/ulatencyd   $(BINDIR)/ulatencyd
 	install -Dm755 $(SRCDIR)target/release/ulatencyctl $(USRBIN)/ulatencyctl
 	@INIT=$$(cat /proc/1/comm 2>/dev/null || echo unknown); \
@@ -45,15 +46,18 @@ install-config:
 	install -dm755 $(CONFDIR)/rules
 	test -f $(CONFDIR)/ulatencyd.toml || install -m644 $(SRCDIR)ulatencyd.toml $(CONFDIR)/ulatencyd.toml
 
-install-dbus:
-	install -Dm644 $(SRCDIR)contrib/dbus/org.ulatencyd.Ulatencyd1.conf \
-	    $(DBUSDIR)/org.ulatencyd.Ulatencyd1.conf
+install-polkit:
+	install -Dm644 $(SRCDIR)contrib/polkit/rs.ulatencyd.policy \
+	    $(POLKITACTS)/rs.ulatencyd.policy
+	install -Dm644 $(SRCDIR)contrib/polkit/rs.ulatencyd.rules \
+	    $(POLKITRULES)/rs.ulatencyd.rules
 
 uninstall:
 	rm -f  $(BINDIR)/ulatencyd
 	rm -f  $(USRBIN)/ulatencyctl
 	rm -rf $(RULESDIR)
-	rm -f  $(DBUSDIR)/org.ulatencyd.Ulatencyd1.conf
+	rm -f  $(POLKITACTS)/rs.ulatencyd.policy
+	rm -f  $(POLKITRULES)/rs.ulatencyd.rules
 	rm -f  $(SYSTEMDDIR)/ulatencyd.service
 
 clean:
