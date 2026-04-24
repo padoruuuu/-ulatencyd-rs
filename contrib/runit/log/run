@@ -1,0 +1,3 @@
+#!/bin/sh
+# runit log service
+exec svlogd -tt /var/log/ulatencyd

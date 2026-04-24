@@ -1,0 +1,68 @@
+# rules/30-gaming.toml
+# Gaming-related processes.
+
+[[rule]]
+name     = "steam"
+priority = 70
+
+[rule.match]
+comm = ["steam", "steam_osx", "steamwebhelper"]
+
+[rule.action]
+cgroup = "interactive"
+nice   = -5
+
+[[rule]]
+name     = "gamescope-game"
+priority = 80
+
+[rule.match]
+parent_comm = ["gamescope"]
+
+[rule.action]
+cgroup       = "rt"
+sched_policy = "fifo"
+sched_priority = 60
+
+[[rule]]
+name     = "wine"
+priority = 65
+
+[rule.match]
+comm_prefix = ["wine", "wineserver", "winedevice"]
+
+[rule.action]
+cgroup = "interactive"
+nice   = -5
+
+[[rule]]
+name     = "lutris"
+priority = 60
+
+[rule.match]
+comm = ["lutris"]
+
+[rule.action]
+cgroup = "interactive"
+
+[[rule]]
+name     = "heroic"
+priority = 60
+
+[rule.match]
+comm = ["heroic", "heroic-games-launcher"]
+
+[rule.action]
+cgroup = "interactive"
+
+[[rule]]
+name     = "mangohud"
+priority = 75
+
+[rule.match]
+comm = ["MangoHud", "mangohud"]
+
+[rule.action]
+cgroup       = "rt"
+sched_policy = "fifo"
+sched_priority = 20

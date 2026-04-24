@@ -1,0 +1,4 @@
+[toolchain]
+channel = "stable"
+# Minimum Rust version required: 1.82 (edition2024 support in deps)
+# Install via: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
