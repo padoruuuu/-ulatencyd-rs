@@ -1,0 +1,82 @@
+# rules/20-desktop.toml
+# Desktop and compositor processes that need low-latency scheduling.
+
+[[rule]]
+name     = "compositor-wayland"
+priority = 80
+
+[rule.match]
+comm = ["sway", "kwin_wayland", "mutter", "weston", "gamescope",
+        "Hyprland", "river", "wayfire", "labwc"]
+
+[rule.action]
+cgroup       = "interactive"
+sched_policy = "fifo"
+sched_priority = 70
+oom_score_adj = -1000
+
+[[rule]]
+name     = "xorg"
+priority = 78
+
+[rule.match]
+comm = ["Xorg", "X"]
+
+[rule.action]
+cgroup       = "interactive"
+sched_policy = "fifo"
+sched_priority = 60
+oom_score_adj = -1000
+
+[[rule]]
+name     = "dbus-broker"
+priority = 70
+
+[rule.match]
+comm = ["dbus-broker", "dbus-daemon"]
+
+[rule.action]
+cgroup       = "system"
+oom_score_adj = -500
+
+[[rule]]
+name     = "ibus"
+priority = 65
+
+[rule.match]
+comm_prefix = ["ibus-"]
+
+[rule.action]
+cgroup = "interactive"
+nice   = -5
+
+[[rule]]
+name     = "input-method-daemon"
+priority = 65
+
+[rule.match]
+comm = ["fcitx5", "fcitx", "gcr-prompter"]
+
+[rule.action]
+cgroup = "interactive"
+nice   = -5
+
+[[rule]]
+name     = "notification-daemon"
+priority = 60
+
+[rule.match]
+comm = ["dunst", "mako", "swaync", "xfce4-notifyd"]
+
+[rule.action]
+cgroup = "interactive"
+
+[[rule]]
+name     = "ime-ui"
+priority = 60
+
+[rule.match]
+comm = ["ibus-ui-gtk3", "ibus-extension-gtk3"]
+
+[rule.action]
+cgroup = "interactive"

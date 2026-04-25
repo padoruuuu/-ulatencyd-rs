@@ -1,0 +1,38 @@
+// /usr/share/polkit-1/rules.d/rs.ulatencyd.rules
+// Install: sudo cp contrib/polkit/rs.ulatencyd.rules \
+//              /usr/share/polkit-1/rules.d/rs.ulatencyd.rules
+
+polkit.addRule(function(action, subject) {
+    // All ulatencyd actions require a local active session.
+    if (action.id.indexOf("rs.ulatencyd.") !== 0) {
+        return polkit.Result.NOT_HANDLED;
+    }
+
+    // Root always gets through.
+    if (subject.user === "root") {
+        return polkit.Result.YES;
+    }
+
+    // Read-only queries and foreground hints: any active local session.
+    var passthrough = [
+        "rs.ulatencyd.query",
+        "rs.ulatencyd.set-foreground",
+        "rs.ulatencyd.set-cgroup",
+    ];
+    if (passthrough.indexOf(action.id) !== -1) {
+        if (subject.active && subject.local) {
+            return polkit.Result.YES;
+        }
+        return polkit.Result.NO;
+    }
+
+    // Rule reload: require admin (wheel group) with password.
+    if (action.id === "rs.ulatencyd.reload-rules") {
+        if (subject.active && subject.local && subject.isInGroup("wheel")) {
+            return polkit.Result.AUTH_SELF_KEEP;
+        }
+        return polkit.Result.AUTH_ADMIN;
+    }
+
+    return polkit.Result.NOT_HANDLED;
+});

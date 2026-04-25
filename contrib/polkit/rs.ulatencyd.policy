@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
+
+<!--
+  /usr/share/polkit-1/actions/rs.ulatencyd.policy
+  Install: sudo cp contrib/polkit/rs.ulatencyd.policy \
+               /usr/share/polkit-1/actions/rs.ulatencyd.policy
+-->
+
+<policyconfig>
+  <vendor>ulatencyd-rs</vendor>
+  <vendor_url>https://github.com/example/ulatencyd-rs</vendor_url>
+
+  <!-- ── Read-only queries: any active local session, no password ── -->
+
+  <action id="rs.ulatencyd.query">
+    <description>Query ulatencyd daemon status and process information</description>
+    <message>Authentication is required to query ulatencyd</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
+
+  <!-- ── Foreground hint: compositor/WM use, active session, no password ── -->
+
+  <action id="rs.ulatencyd.set-foreground">
+    <description>Notify ulatencyd of the foreground process</description>
+    <message>Authentication is required to set the foreground process</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
+
+  <!-- ── Cgroup override: active session, no password ── -->
+
+  <action id="rs.ulatencyd.set-cgroup">
+    <description>Move a process to a different cgroup tier</description>
+    <message>Authentication is required to change a process cgroup tier</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
+
+  <!-- ── Rule reload: requires admin authentication ── -->
+
+  <action id="rs.ulatencyd.reload-rules">
+    <description>Reload ulatencyd scheduling rules from disk</description>
+    <message>Authentication is required to reload ulatencyd rules</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+</policyconfig>

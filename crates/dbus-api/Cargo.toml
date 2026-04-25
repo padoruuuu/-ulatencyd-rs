@@ -1,0 +1,16 @@
+[package]
+name    = "dbus-api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+procmon   = { path = "../procmon" }
+cgroupv2  = { path = "../cgroupv2" }
+psi       = { path = "../psi" }
+rules     = { path = "../rules" }
+tokio     = { workspace = true }
+anyhow    = { workspace = true }
+tracing   = { workspace = true }
+serde     = { workspace = true }
+serde_json = { workspace = true }
+zbus      = { workspace = true }
