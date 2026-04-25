@@ -1,8 +1,0 @@
-#!/bin/sh
-# runit service: /etc/sv/ulatencyd/run
-#
-# Install:
-#   sudo cp -r contrib/runit /etc/sv/ulatencyd
-#   sudo ln -s /etc/sv/ulatencyd /var/service/
-
-exec /usr/sbin/ulatencyd 2>&1
