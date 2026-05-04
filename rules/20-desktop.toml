@@ -1,0 +1,44 @@
+# rules/20-desktop.toml
+# Named overrides for processes whose default classification is wrong.
+#
+# The rule engine now classifies ALL processes by default:
+#   uid>0 in user session  → interactive  (any desktop app, new or unknown)
+#   uid>0 user service     → system
+#   uid=0 / system service → system
+#
+# This file only needs entries for processes that need DIFFERENT treatment
+# from their default, or need oom_score_adj protection.
+
+# Compositors/WMs — default would put them in interactive (correct tier),
+# but they must NOT be moved (cgroup managed by logind). Only set oom.
+[[rule]]
+name     = "compositor"
+priority = 80
+[rule.match]
+comm = ["sway", "kwin_wayland", "kwin_x11", "mutter", "weston",
+        "gamescope", "Hyprland", "river", "wayfire", "labwc",
+        "openbox", "i3", "bspwm", "herbstluftwm", "qtile",
+        "awesome", "xmonad", "dwm", "spectrwm", "fluxbox",
+        "jwm", "icewm", "Xorg", "X", "Xwayland"]
+[rule.action]
+# No cgroup — stays in session cgroup (enforced by no_cgroup_move list).
+oom_score_adj = -1000
+
+# Display managers — uid=0, would default to system tier which is fine,
+# but need OOM protection.
+[[rule]]
+name     = "display-manager"
+priority = 75
+[rule.match]
+comm = ["sddm", "gdm", "gdm3", "lightdm", "greetd", "lxdm", "ly-dm"]
+[rule.action]
+oom_score_adj = -1000
+
+# D-Bus — must stay in its own scope (no cgroup move), protect from OOM.
+[[rule]]
+name     = "dbus"
+priority = 70
+[rule.match]
+comm = ["dbus-broker", "dbus-broker-lau", "dbus-daemon"]
+[rule.action]
+oom_score_adj = -500

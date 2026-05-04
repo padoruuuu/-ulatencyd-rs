@@ -1,0 +1,31 @@
+# /etc/ulatencyd/ulatencyd.toml
+# Default configuration for ulatencyd-rs.
+# All values shown are defaults; omit a section to use the defaults.
+
+[daemon]
+log_level                   = "info"
+pid_file                    = "/run/ulatencyd.pid"
+rules_dir                   = ["/etc/ulatencyd/rules", "/usr/lib/ulatencyd/rules"]
+rescan_interval_secs        = 30
+apply_to_existing_processes = true
+
+[cgroups]
+# Override the cgroup root on non-systemd systems (auto-detected by default).
+# cgroup_root = "/sys/fs/cgroup/ulatencyd"
+
+[pressure]
+memory_low_threshold  = 5.0    # %  — below this is Normal
+memory_high_threshold = 40.0   # %  — above this is High/Critical
+io_high_threshold     = 60.0   # %
+check_interval_ms     = 500
+
+[fork_bomb]
+threshold_per_second = 150  # forks from a single parent before throttle
+lineage_depth        = 5    # how many generations to throttle
+
+[sched]
+autogroup_enabled = false   # disable kernel autogroup for better cgroup isolation
+detect_and_defer  = true    # skip cpu.weight when sched_ext is active
+
+[dbus]
+enabled = true

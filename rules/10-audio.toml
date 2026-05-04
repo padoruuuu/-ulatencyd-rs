@@ -1,0 +1,40 @@
+# rules/10-audio.toml
+# Audio daemons.
+#
+# pipewire, wireplumber, pulseaudio, jackd use session-scoped Unix sockets.
+# Moving them out of their session scope breaks audio for all other session
+# processes. They are in no_cgroup_move — only oom_score_adj is applied.
+#
+# Scheduling (SCHED_FIFO) is managed by rtkit-daemon, not by us.
+
+[[rule]]
+name     = "pipewire"
+priority = 90
+[rule.match]
+comm = ["pipewire", "pipewire-pulse", "pipewire-alsa"]
+[rule.action]
+oom_score_adj = -900
+
+[[rule]]
+name     = "wireplumber"
+priority = 88
+[rule.match]
+comm = ["wireplumber"]
+[rule.action]
+oom_score_adj = -800
+
+[[rule]]
+name     = "jackd"
+priority = 90
+[rule.match]
+comm = ["jackd", "jackdbus"]
+[rule.action]
+oom_score_adj = -900
+
+[[rule]]
+name     = "pulseaudio"
+priority = 85
+[rule.match]
+comm = ["pulseaudio"]
+[rule.action]
+oom_score_adj = -800

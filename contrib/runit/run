@@ -1,0 +1,3 @@
+#!/bin/sh
+# /etc/runit/sv/ulatencyd/run
+exec /usr/sbin/ulatencyd 2>&1

@@ -1,0 +1,52 @@
+[Unit]
+Description=ulatencyd-rs — cgroup v2 + scheduler latency daemon
+Documentation=https://github.com/padoruuuu/-ulatencyd-rs
+# Run after D-Bus is available (needed for UPower and our own D-Bus service).
+After=dbus.service
+Wants=dbus.service
+# Do NOT use Before=display-manager.service — we should not block graphical
+# boot. The daemon classifies existing processes on startup so it catches
+# everything even when starting concurrently with the session.
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/sbin/ulatencyd
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+# Give up waiting for READY=1 after 30s so a hung startup doesn't freeze boot.
+TimeoutStartSec=30
+# Never wait more than 5s for the daemon to stop — shutdown should be instant.
+TimeoutStopSec=5
+
+# Only kill the daemon itself on stop — NOT the processes it manages.
+KillMode=process
+
+# TasksMax covers all threads of all processes in our cgroup subtree,
+# not just the daemon. Set to infinity so managed app threads don't
+# trigger the default limit.
+TasksMax=infinity
+
+# Disable memory/task accounting aggregation for the service — otherwise
+# systemd attributes the RAM of every managed process (Firefox, Discord, etc.)
+# to the daemon, making systemctl status look like it's using 30GB of RAM.
+MemoryAccounting=no
+CPUAccounting=no
+TasksAccounting=no
+
+# Delegate=yes gives write access to our service's cgroup subtree.
+Delegate=yes
+
+# Capabilities needed to set scheduler policies and write oom_score_adj.
+AmbientCapabilities=CAP_SYS_NICE CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_SYS_NICE CAP_NET_ADMIN
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+RuntimeDirectory=ulatencyd
+RuntimeDirectoryMode=0755
+ReadWritePaths=/proc /sys/fs/cgroup
+
+[Install]
+WantedBy=multi-user.target

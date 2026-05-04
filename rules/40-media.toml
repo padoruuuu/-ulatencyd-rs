@@ -1,0 +1,34 @@
+# rules/40-media.toml
+# Overrides for apps that need special oom_score_adj protection.
+# Cgroup placement is handled by the default classifier — these rules
+# only add OOM protection on top.
+
+[[rule]]
+name     = "browsers"
+priority = 65
+[rule.match]
+comm = ["firefox", "firefox-bin", "firefox-esr", "firefox-developer-edition",
+        "librewolf", "floorp", "waterfox", "iceweasel",
+        "chromium", "chromium-browser", "google-chrome", "google-chrome-stable",
+        "brave", "brave-browser", "vivaldi-bin", "opera", "ungoogled-chromium"]
+[rule.action]
+# Default classifier already puts these in interactive. Just add OOM protection.
+oom_score_adj = -300
+
+[[rule]]
+name     = "communication"
+priority = 60
+[rule.match]
+comm = ["discord", "vesktop", "slack", "teams", "signal-desktop",
+        "telegram-desktop", "element-desktop", "nheko"]
+[rule.action]
+oom_score_adj = -200
+
+[[rule]]
+name     = "media"
+priority = 55
+[rule.match]
+comm = ["mpv", "vlc", "celluloid", "rhythmbox", "lollypop",
+        "deadbeef", "clementine", "strawberry", "spotify"]
+[rule.action]
+oom_score_adj = -200

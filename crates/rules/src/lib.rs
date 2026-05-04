@@ -1,0 +1,682 @@
+//! Rule engine for ulatencyd-rs.
+//!
+//! Rules are loaded from TOML files in /etc/ulatencyd/rules/ and
+//! /usr/lib/ulatencyd/rules/. Each rule has a set of match predicates
+//! (AND-combined) and an action to apply when all predicates are satisfied.
+//! Rules are sorted by priority (descending); the first match wins unless
+//! `continue = true` is set.
+//!
+//! Profiles support inheritance: `inherits = "sound-server"` merges the
+//! parent's action into the child before overrides are applied.
+
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use tracing::{debug, info};
+use wildmatch::WildMatch;
+
+use procmon::ProcessInfo;
+
+// ---------------------------------------------------------------------------
+// Wire types (deserialized from TOML)
+// ---------------------------------------------------------------------------
+
+/// A complete rule file (array of [[rule]] entries plus optional [[profile]]).
+#[derive(Debug, Deserialize, Default)]
+struct RuleFile {
+    #[serde(default)]
+    rule: Vec<RuleToml>,
+    #[serde(default)]
+    profile: Vec<ProfileToml>,
+}
+
+/// Raw TOML representation of a [[rule]].
+#[derive(Debug, Deserialize)]
+struct RuleToml {
+    name:     String,
+    #[serde(default = "default_priority")]
+    priority: i32,
+    #[serde(default)]
+    r#match:  MatchToml,
+    action:   ActionToml,
+    #[serde(default)]
+    r#continue: bool,
+}
+
+fn default_priority() -> i32 { 50 }
+
+/// All optional match predicates (AND-combined).
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct MatchToml {
+    #[serde(default)] pub comm:                Vec<String>,
+    #[serde(default)] pub comm_prefix:         Vec<String>,
+    #[serde(default)] pub cmdline_contains:    Vec<String>,
+    #[serde(default)] pub exe_path:            Vec<String>,
+    #[serde(default)] pub uid:                 Vec<u32>,
+    #[serde(default)] pub env_set:             Vec<String>,
+    pub min_threads:   Option<u32>,
+    pub min_rss_mb:    Option<u64>,
+    #[serde(default)] pub parent_comm:         Vec<String>,
+    #[serde(default)] pub cgroup_path_contains: Vec<String>,
+    /// Wildmatch glob, e.g. "/user.slice/*.service"
+    pub cgroup_path:   Option<String>,
+}
+
+/// Action applied when a rule matches.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct ActionToml {
+    pub cgroup:              Option<String>,
+    pub nice:                Option<i8>,
+    pub sched_policy:        Option<String>,
+    pub sched_priority:      Option<u8>,
+    pub oom_score_adj:       Option<i32>,
+    pub io_weight:           Option<u32>,
+    pub recheck_secs:        Option<u64>,
+    pub apply_to_children:   Option<bool>,
+    pub script:              Option<String>,
+}
+
+/// A [[profile]] block (used for inheritance).
+#[derive(Debug, Deserialize, Clone)]
+struct ProfileToml {
+    name:     String,
+    inherits: Option<String>,
+    #[serde(flatten)]
+    action:   ActionToml,
+}
+
+// ---------------------------------------------------------------------------
+// Compiled internal types
+// ---------------------------------------------------------------------------
+
+/// Compiled, resolved rule (no inheritance indirection).
+#[derive(Debug, Clone)]
+pub struct Rule {
+    pub name:       String,
+    pub priority:   i32,
+    pub matchers:   Matchers,
+    pub action:     Action,
+    pub continue_:  bool,
+}
+
+/// Compiled match predicates.
+#[derive(Debug, Clone, Default)]
+pub struct Matchers {
+    pub comm:                Vec<String>,
+    pub comm_prefix:         Vec<String>,
+    pub cmdline_contains:    Vec<String>,
+    pub exe_path:            Vec<PathBuf>,
+    pub uid:                 Vec<u32>,
+    pub env_set:             Vec<String>,
+    pub min_threads:         Option<u32>,
+    pub min_rss_mb:          Option<u64>,
+    pub parent_comm:         Vec<String>,
+    pub cgroup_path_contains: Vec<String>,
+    /// Pre-compiled wildmatch pattern (only when pattern contains * or ?).
+    pub cgroup_path_glob:    Option<(String, WildMatch)>,
+    /// Exact cgroup path (no glob characters).
+    pub cgroup_path_exact:   Option<String>,
+}
+
+impl Matchers {
+    fn matches(&self, proc: &ProcessInfo, parent_comm: Option<&str>) -> bool {
+        if !self.comm.is_empty() && !self.comm.iter().any(|c| c == &proc.comm) {
+            return false;
+        }
+        if !self.comm_prefix.is_empty() && !self.comm_prefix.iter().any(|p| proc.comm.starts_with(p.as_str())) {
+            return false;
+        }
+        if !self.cmdline_contains.is_empty() {
+            let joined = proc.cmdline.join(" ");
+            if !self.cmdline_contains.iter().any(|s| joined.contains(s.as_str())) {
+                return false;
+            }
+        }
+        if !self.exe_path.is_empty() {
+            let exe_match = proc.exe.as_ref()
+                .map(|e| self.exe_path.iter().any(|p| p == e))
+                .unwrap_or(false);
+            if !exe_match { return false; }
+        }
+        if !self.uid.is_empty() && !self.uid.contains(&proc.uid) {
+            return false;
+        }
+        if !self.env_set.is_empty() {
+            if !self.env_set.iter().all(|k| proc.environ.contains_key(k.as_str())) {
+                return false;
+            }
+        }
+        if let Some(min_t) = self.min_threads {
+            if proc.threads < min_t { return false; }
+        }
+        if let Some(min_rss) = self.min_rss_mb {
+            if proc.vm_rss_kb / 1024 < min_rss { return false; }
+        }
+        if !self.parent_comm.is_empty() {
+            let pc = parent_comm.unwrap_or("");
+            if !self.parent_comm.iter().any(|c| c == pc) { return false; }
+        }
+        if let Some(ref cgroup) = proc.cgroup_path {
+            if !self.cgroup_path_contains.is_empty() {
+                if !self.cgroup_path_contains.iter().any(|s| cgroup.contains(s.as_str())) {
+                    return false;
+                }
+            }
+            if let Some((_, ref glob)) = self.cgroup_path_glob {
+                if !glob.matches(cgroup) { return false; }
+            }
+            if let Some(ref exact) = self.cgroup_path_exact {
+                if cgroup != exact { return false; }
+            }
+        } else if self.cgroup_path_glob.is_some() || self.cgroup_path_exact.is_some() {
+            return false;
+        }
+        true
+    }
+}
+
+/// Resolved action to apply to a process.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Action {
+    pub cgroup:            Option<String>,
+    pub nice:              Option<i8>,
+    pub sched_policy:      Option<String>,
+    pub sched_priority:    Option<u8>,
+    pub oom_score_adj:     Option<i32>,
+    pub io_weight:         Option<u32>,
+    pub recheck_secs:      Option<u64>,
+    pub apply_to_children: bool,
+    pub rule_name:         String,
+}
+
+// ---------------------------------------------------------------------------
+// Exception list
+// ---------------------------------------------------------------------------
+
+/// Processes that must never be touched by the daemon.
+pub struct ExceptionList {
+    /// Fully exempt — skip all rule engine actions entirely.
+    pub fully_exempt: HashSet<String>,
+    /// Cgroup-move exempt — rules match and oom_score_adj applies,
+    /// but the cgroup field in any matching action is cleared.
+    /// Used for compositors/WMs whose session cgroup placement must not change.
+    pub no_cgroup_move: HashSet<String>,
+    /// Ancestor exempt — if any ancestor has one of these names, fully exempt.
+    pub ancestor_names: HashSet<String>,
+}
+
+impl Default for ExceptionList {
+    fn default() -> Self {
+        let fully_exempt: &[&str] = &[
+            // Scheduler/priority tools.
+            "chrt", "gamemoderun", "ionice",
+            "nice", "rtkit-daemon", "taskset", "schedtool", "systemd",
+            // Sandbox runtimes — moving breaks namespace setup.
+            "bwrap", "bubblewrap", "firejail", "flatpak-spawn",
+            "pressure-vessel", "run",
+        ];
+        let no_cgroup_move: &[&str] = &[
+            // Compositors and WMs — may be uid=0 or start before session scope.
+            "sway", "kwin_wayland", "kwin_x11", "mutter", "weston",
+            "gamescope", "Hyprland", "river", "wayfire", "labwc",
+            "openbox", "i3", "bspwm", "herbstluftwm", "qtile",
+            "awesome", "xmonad", "dwm", "spectrwm", "fluxbox", "jwm", "icewm",
+            // X server.
+            "Xorg", "X", "Xwayland",
+            // Display managers (uid=0, before session exists).
+            "sddm", "gdm", "gdm3", "lightdm", "greetd", "lxdm", "ly-dm",
+            // D-Bus — own scope, not a session scope.
+            "dbus-daemon", "dbus-broker", "dbus-broker-lau",
+            // All other user session processes (audio, browsers, settings,
+            // terminals, etc.) are protected by the UserInteractive
+            // session_origin check in is_cgroup_exempt — no need to list them.
+        ];
+        let anc: &[&str] = &[
+            "chrt", "gamemoderun", "ionice", "nice", "taskset", "schedtool",
+            "bwrap", "bubblewrap", "firejail", "flatpak-spawn", "pressure-vessel",
+        ];
+        Self {
+            fully_exempt:   fully_exempt.iter().map(|s| s.to_string()).collect(),
+            no_cgroup_move: no_cgroup_move.iter().map(|s| s.to_string()).collect(),
+            ancestor_names: anc.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+}
+
+impl ExceptionList {
+    pub fn is_exempt(&self, proc: &ProcessInfo, ancestor_comms: &[String]) -> bool {
+        if self.fully_exempt.contains(&proc.comm) {
+            return true;
+        }
+        ancestor_comms.iter().any(|c| self.ancestor_names.contains(c))
+    }
+
+    /// Returns true if the process should not have its cgroup changed.
+    ///
+    /// Only applies to specific uid=0 processes that must stay in their
+    /// own scope (compositors, display managers, D-Bus) and to children
+    /// of those processes.
+    ///
+    /// uid>=1000 user processes are handled by default_cgroup_for returning
+    /// None — they are never moved by the default classifier. Named rules
+    /// (apt, make, find, etc.) can still explicitly move uid>=1000 processes.
+    pub fn is_cgroup_exempt(&self, proc: &ProcessInfo, ancestor_comms: &[String]) -> bool {
+        if self.no_cgroup_move.contains(&proc.comm) {
+            return true;
+        }
+        ancestor_comms.iter().any(|a| self.no_cgroup_move.contains(a))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule engine
+// ---------------------------------------------------------------------------
+
+pub struct RuleEngine {
+    rules: Vec<Rule>,
+    exceptions: ExceptionList,
+}
+
+impl RuleEngine {
+    /// Load rules from a list of directories. Later directories take precedence.
+    pub fn load(dirs: &[PathBuf]) -> Result<Self> {
+        let rules = load_rules(dirs)?;
+        Ok(Self {
+            rules,
+            exceptions: ExceptionList::default(),
+        })
+    }
+
+    /// Classify a process. Returns an action to apply, or None if the
+    /// process is a kernel thread or should be left untouched.
+    ///
+    /// Classification order:
+    ///   1. Kernel threads → None (never touched)
+    ///   2. Fully exempt processes → None
+    ///   3. Named override rules (TOML files) — highest priority
+    ///   4. Default by session_origin + uid — catches everything else
+    ///      without needing to know any app names
+    pub fn classify(
+        &self,
+        proc: &ProcessInfo,
+        ancestor_comms: &[String],
+    ) -> Option<Action> {
+        use procmon::SessionOrigin;
+
+        // Kernel threads — never touch.
+        if proc.is_kernel_thread {
+            return None;
+        }
+
+        // Fully exempt (sandbox runtimes, scheduler tools).
+        if self.exceptions.is_exempt(proc, ancestor_comms) {
+            debug!("pid {} ({}) is exempt", proc.pid, proc.comm);
+            return None;
+        }
+
+        let cgroup_exempt = self.exceptions.is_cgroup_exempt(proc, ancestor_comms);
+
+        let has_rt = matches!(
+            proc.sched_policy,
+            procmon::SchedPolicy::Fifo(_) | procmon::SchedPolicy::RoundRobin(_) | procmon::SchedPolicy::Deadline
+        );
+
+        let parent = ancestor_comms.first().map(|s| s.as_str());
+        let mut result: Option<Action> = None;
+
+        // Named rules (TOML overrides).
+        for rule in &self.rules {
+            if rule.matchers.matches(proc, parent) {
+                let mut action = rule.action.clone();
+                action.rule_name = rule.name.clone();
+
+                if cgroup_exempt {
+                    action.cgroup = None;
+                }
+                if has_rt && action.sched_policy.as_deref() == Some("normal") {
+                    action.sched_policy = None;
+                }
+
+                if let Some(ref mut prev) = result {
+                    merge_action(prev, &action);
+                    if !rule.continue_ { break; }
+                } else {
+                    result = Some(action);
+                    if !rule.continue_ { break; }
+                }
+            }
+        }
+
+        // Default classification by session origin — applies when no named
+        // rule matched, or when a rule didn't set a cgroup tier.
+        // This makes new apps work correctly without any rule updates.
+        if result.is_none() || result.as_ref().and_then(|a| a.cgroup.as_ref()).is_none() {
+            let default_cgroup = if cgroup_exempt {
+                None // compositors/WMs stay in their session cgroup
+            } else {
+                default_cgroup_for(proc)
+            };
+
+            if let Some(cgroup) = default_cgroup {
+                let default_action = Action {
+                    cgroup:     Some(cgroup),
+                    rule_name:  "default".into(),
+                    ..Default::default()
+                };
+                if let Some(ref mut existing) = result {
+                    // Named rule set oom/nice but not cgroup — fill in default.
+                    if existing.cgroup.is_none() {
+                        existing.cgroup    = default_action.cgroup;
+                        existing.rule_name = format!("{}+default", existing.rule_name);
+                    }
+                } else {
+                    result = Some(default_action);
+                }
+            }
+        }
+
+        // If every field ended up None after stripping, return None so the
+        // process is marked classified without any writes.
+        if let Some(ref a) = result {
+            if a.cgroup.is_none() && a.nice.is_none() && a.sched_policy.is_none()
+                && a.oom_score_adj.is_none() && a.io_weight.is_none()
+            {
+                return None;
+            }
+        }
+
+        result
+    }
+
+    /// Hot-reload rules from disk.
+    pub fn reload(&mut self, dirs: &[PathBuf]) -> Result<()> {
+        self.rules = load_rules(dirs)?;
+        info!("rules reloaded: {} rules", self.rules.len());
+        Ok(())
+    }
+
+    pub fn rule_count(&self) -> usize {
+        self.rules.len()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Default classification by session origin
+// ---------------------------------------------------------------------------
+
+/// Derive a default cgroup tier from process metadata without knowing the
+/// app name. Works on all init systems.
+///
+/// Rules:
+///   uid > 0, UserInteractive/UserApp/Unknown → interactive
+///   uid > 0, UserService                     → system
+///   uid = 0, SystemService                   → system
+///   uid = 0, UserInteractive (su/sudo child) → system
+fn default_cgroup_for(proc: &procmon::ProcessInfo) -> Option<String> {
+    use procmon::SessionOrigin;
+
+    // Never move user processes (uid >= 1000) by default.
+    //
+    // User processes live in logind session scopes and use session-scoped
+    // sockets/D-Bus for IPC. Moving ANY of them breaks audio, settings
+    // daemons, volume controls, browsers, and any other session service.
+    //
+    // Named rules in the rules/ directory handle the specific user processes
+    // that SHOULD be moved (package managers, build tools, etc.) explicitly.
+    // Everything else stays where the session manager placed it.
+    if proc.uid >= 1000 {
+        return None;
+    }
+
+    // For uid=0 and system service accounts (uid 1-999): classify by origin.
+    // Real system services go to the system tier. Kernel threads are skipped.
+    match &proc.session_origin {
+        SessionOrigin::SystemService   => Some("system".into()),
+        SessionOrigin::UserService     => Some("system".into()),
+        // uid<1000 in a user interactive session = sudo child, polkit helper etc.
+        SessionOrigin::UserInteractive => Some("system".into()),
+        SessionOrigin::Unknown         => Some("system".into()),
+        SessionOrigin::KernelThread    => None,
+        #[allow(unreachable_patterns)]
+        _                              => Some("system".into()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Loading and compiling
+// ---------------------------------------------------------------------------
+
+fn load_rules(dirs: &[PathBuf]) -> Result<Vec<Rule>> {
+    let mut profile_map: HashMap<String, ActionToml> = HashMap::new();
+    let mut all_rules: Vec<Rule> = Vec::new();
+
+    for dir in dirs {
+        if !dir.exists() { continue; }
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .with_context(|| format!("read rules dir {}", dir.display()))?
+            .flatten()
+            .filter(|e| e.path().extension().map_or(false, |x| x == "toml"))
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+
+        for entry in entries {
+            let path = entry.path();
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("read rule file {}", path.display()))?;
+            let rf: RuleFile = toml::from_str(&text)
+                .with_context(|| format!("parse rule file {}", path.display()))?;
+
+            // Register profiles first (build inheritance map).
+            for prof in rf.profile {
+                let resolved = resolve_profile_action(&prof, &profile_map);
+                profile_map.insert(prof.name.clone(), resolved);
+            }
+
+            // Compile rules.
+            for r in rf.rule {
+                all_rules.push(compile_rule(r, &profile_map)?);
+            }
+        }
+    }
+
+    // Sort by priority descending (stable to preserve file order within same priority).
+    all_rules.sort_by(|a, b| b.priority.cmp(&a.priority));
+    info!("loaded {} rules from {} directories", all_rules.len(), dirs.len());
+    Ok(all_rules)
+}
+
+fn resolve_profile_action(prof: &ProfileToml, map: &HashMap<String, ActionToml>) -> ActionToml {
+    if let Some(ref parent) = prof.inherits {
+        if let Some(base) = map.get(parent) {
+            let mut merged = base.clone();
+            // Override parent with prof's non-None fields.
+            if prof.action.cgroup.is_some()          { merged.cgroup          = prof.action.cgroup.clone(); }
+            if prof.action.nice.is_some()             { merged.nice             = prof.action.nice; }
+            if prof.action.sched_policy.is_some()     { merged.sched_policy     = prof.action.sched_policy.clone(); }
+            if prof.action.sched_priority.is_some()   { merged.sched_priority   = prof.action.sched_priority; }
+            if prof.action.oom_score_adj.is_some()    { merged.oom_score_adj    = prof.action.oom_score_adj; }
+            if prof.action.io_weight.is_some()        { merged.io_weight        = prof.action.io_weight; }
+            if prof.action.recheck_secs.is_some()     { merged.recheck_secs     = prof.action.recheck_secs; }
+            if prof.action.apply_to_children.is_some(){ merged.apply_to_children = prof.action.apply_to_children; }
+            return merged;
+        }
+    }
+    prof.action.clone()
+}
+
+fn compile_rule(r: RuleToml, _profiles: &HashMap<String, ActionToml>) -> Result<Rule> {
+    let m = &r.r#match;
+
+    let (cgroup_path_glob, cgroup_path_exact) =
+        if let Some(ref pattern) = m.cgroup_path {
+            if pattern.contains('*') || pattern.contains('?') {
+                (Some((pattern.clone(), WildMatch::new(pattern))), None)
+            } else {
+                (None, Some(pattern.clone()))
+            }
+        } else {
+            (None, None)
+        };
+
+    let matchers = Matchers {
+        comm:                 m.comm.clone(),
+        comm_prefix:          m.comm_prefix.clone(),
+        cmdline_contains:     m.cmdline_contains.clone(),
+        exe_path:             m.exe_path.iter().map(PathBuf::from).collect(),
+        uid:                  m.uid.clone(),
+        env_set:              m.env_set.clone(),
+        min_threads:          m.min_threads,
+        min_rss_mb:           m.min_rss_mb,
+        parent_comm:          m.parent_comm.clone(),
+        cgroup_path_contains: m.cgroup_path_contains.clone(),
+        cgroup_path_glob,
+        cgroup_path_exact,
+    };
+
+    let at = &r.action;
+    let action = Action {
+        cgroup:            at.cgroup.clone(),
+        nice:              at.nice,
+        sched_policy:      at.sched_policy.clone(),
+        sched_priority:    at.sched_priority,
+        oom_score_adj:     at.oom_score_adj,
+        io_weight:         at.io_weight,
+        recheck_secs:      at.recheck_secs,
+        apply_to_children: at.apply_to_children.unwrap_or(false),
+        rule_name:         r.name.clone(),
+    };
+
+    Ok(Rule {
+        name:      r.name,
+        priority:  r.priority,
+        matchers,
+        action,
+        continue_: r.r#continue,
+    })
+}
+
+/// Merge `src` into `dst`, only overriding fields that are None in dst.
+fn merge_action(dst: &mut Action, src: &Action) {
+    if dst.cgroup.is_none()         { dst.cgroup         = src.cgroup.clone(); }
+    if dst.nice.is_none()           { dst.nice           = src.nice; }
+    if dst.sched_policy.is_none()   { dst.sched_policy   = src.sched_policy.clone(); }
+    if dst.sched_priority.is_none() { dst.sched_priority = src.sched_priority; }
+    if dst.oom_score_adj.is_none()  { dst.oom_score_adj  = src.oom_score_adj; }
+    if dst.io_weight.is_none()      { dst.io_weight      = src.io_weight; }
+    if dst.recheck_secs.is_none()   { dst.recheck_secs   = src.recheck_secs; }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_proc(comm: &str) -> ProcessInfo {
+        ProcessInfo {
+            pid: 1234, ppid: 1, uid: 1000, gid: 1000,
+            comm: comm.to_string(),
+            cmdline: vec![comm.to_string()],
+            exe: None, oom_score: 0, threads: 1, vm_rss_kb: 0,
+            io_read_bytes: 0, io_write_bytes: 0,
+            sched_policy: procmon::SchedPolicy::Normal,
+            nice: 0, cgroup_path: None,
+            session_origin: procmon::SessionOrigin::Unknown,
+            is_kernel_thread: false,
+            environ: Default::default(),
+        }
+    }
+
+    #[test]
+    fn exception_list_exact_match() {
+        let ex = ExceptionList::default();
+        let proc = make_proc("chrt");
+        assert!(ex.is_exempt(&proc, &[]));
+    }
+
+    #[test]
+    fn exception_list_ancestor() {
+        let ex = ExceptionList::default();
+        let proc = make_proc("my-app");
+        let ancestors = vec!["gamemoderun".to_string()];
+        assert!(ex.is_exempt(&proc, &ancestors));
+    }
+
+    #[test]
+    fn exception_list_normal_not_exempt() {
+        let ex = ExceptionList::default();
+        let proc = make_proc("firefox");
+        assert!(!ex.is_exempt(&proc, &[]));
+    }
+
+    #[test]
+    fn compositor_cgroup_exempt_but_not_fully_exempt() {
+        let ex = ExceptionList::default();
+        let proc = make_proc("sway");
+        assert!(!ex.is_exempt(&proc, &[]));
+        assert!(ex.is_cgroup_exempt(&proc, &[]));
+    }
+
+    #[test]
+    fn firefox_child_inherits_cgroup_exempt() {
+        let ex = ExceptionList::default();
+        let ancestors = vec!["firefox".to_string()];
+        let child = make_proc("Isolated Web Co");
+        assert!(ex.is_cgroup_exempt(&child, &ancestors));
+        let plain = make_proc("alacritty");
+        assert!(!ex.is_cgroup_exempt(&plain, &[]));
+    }
+
+    #[test]
+    fn pipewire_child_inherits_cgroup_exempt() {
+        let ex = ExceptionList::default();
+        let ancestors = vec!["pipewire".to_string()];
+        let child = make_proc("pw-jack");
+        assert!(ex.is_cgroup_exempt(&child, &ancestors));
+    }
+
+    #[test]
+    fn user_session_process_not_moved_by_default() {
+        // uid>=1000 processes return None from default_cgroup_for, so they
+        // are never moved by the default classifier regardless of name.
+        // This is tested at the classify() level, not is_cgroup_exempt().
+        let ex = ExceptionList::default();
+        let mut proc = make_proc("xfce4-volumed");
+        proc.uid = 1000;
+        proc.session_origin = procmon::SessionOrigin::UserInteractive;
+        // is_cgroup_exempt only fires for explicit list + ancestor chain now.
+        // Protection for uid>=1000 is in default_cgroup_for returning None.
+        assert!(!ex.is_cgroup_exempt(&proc, &[]));
+    }
+
+    #[test]
+    fn matchers_comm_match() {
+        let m = Matchers {
+            comm: vec!["pipewire".to_string()],
+            ..Default::default()
+        };
+        let proc = make_proc("pipewire");
+        assert!(m.matches(&proc, None));
+    }
+
+    #[test]
+    fn matchers_comm_no_match() {
+        let m = Matchers {
+            comm: vec!["jackd".to_string()],
+            ..Default::default()
+        };
+        let proc = make_proc("firefox");
+        assert!(!m.matches(&proc, None));
+    }
+
+    #[test]
+    fn wildmatch_cgroup_glob() {
+        use wildmatch::WildMatch;
+        let pattern = "/user.slice/*.service";
+        let glob = WildMatch::new(pattern);
+        assert!(glob.matches("/user.slice/app.service"));
+        assert!(!glob.matches("/system.slice/app.service"));
+    }
+}
