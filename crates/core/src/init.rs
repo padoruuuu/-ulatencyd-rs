@@ -78,6 +78,7 @@ pub struct SupervisorNotify {
 }
 
 impl SupervisorNotify {
+    #[allow(dead_code)]
     pub fn new(init: InitSystem) -> Self {
         Self { init }
     }

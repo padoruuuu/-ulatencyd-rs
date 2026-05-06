@@ -209,12 +209,12 @@ pub struct ExceptionList {
 impl Default for ExceptionList {
     fn default() -> Self {
         let fully_exempt: &[&str] = &[
-            // Scheduler/priority tools.
-            "chrt", "gamemoderun", "ionice",
-            "nice", "rtkit-daemon", "taskset", "schedtool", "systemd",
-            // Sandbox runtimes — moving breaks namespace setup.
-            "bwrap", "bubblewrap", "firejail", "flatpak-spawn",
-            "pressure-vessel", "run",
+            // Scheduler/priority tools — never override scheduling they set explicitly.
+            "chrt", "ionice", "nice", "taskset", "schedtool", "gamemoderun",
+            // rtkit — it manages RT priorities for audio; we must not interfere.
+            "rtkit-daemon",
+            // Sandbox runtimes — moving them mid-init breaks namespace setup.
+            "bwrap", "bubblewrap", "firejail", "flatpak-spawn", "pressure-vessel",
         ];
         let no_cgroup_move: &[&str] = &[
             // Compositors and WMs — may be uid=0 or start before session scope.
@@ -302,7 +302,6 @@ impl RuleEngine {
         proc: &ProcessInfo,
         ancestor_comms: &[String],
     ) -> Option<Action> {
-        use procmon::SessionOrigin;
 
         // Kernel threads — never touch.
         if proc.is_kernel_thread {
@@ -348,36 +347,7 @@ impl RuleEngine {
             }
         }
 
-        // Default classification by session origin — applies when no named
-        // rule matched, or when a rule didn't set a cgroup tier.
-        // This makes new apps work correctly without any rule updates.
-        if result.is_none() || result.as_ref().and_then(|a| a.cgroup.as_ref()).is_none() {
-            let default_cgroup = if cgroup_exempt {
-                None // compositors/WMs stay in their session cgroup
-            } else {
-                default_cgroup_for(proc)
-            };
-
-            if let Some(cgroup) = default_cgroup {
-                let default_action = Action {
-                    cgroup:     Some(cgroup),
-                    rule_name:  "default".into(),
-                    ..Default::default()
-                };
-                if let Some(ref mut existing) = result {
-                    // Named rule set oom/nice but not cgroup — fill in default.
-                    if existing.cgroup.is_none() {
-                        existing.cgroup    = default_action.cgroup;
-                        existing.rule_name = format!("{}+default", existing.rule_name);
-                    }
-                } else {
-                    result = Some(default_action);
-                }
-            }
-        }
-
-        // If every field ended up None after stripping, return None so the
-        // process is marked classified without any writes.
+        // If every field ended up None, return None — nothing to apply.
         if let Some(ref a) = result {
             if a.cgroup.is_none() && a.nice.is_none() && a.sched_policy.is_none()
                 && a.oom_score_adj.is_none() && a.io_weight.is_none()
@@ -414,33 +384,20 @@ impl RuleEngine {
 ///   uid = 0, SystemService                   → system
 ///   uid = 0, UserInteractive (su/sudo child) → system
 fn default_cgroup_for(proc: &procmon::ProcessInfo) -> Option<String> {
-    use procmon::SessionOrigin;
-
-    // Never move user processes (uid >= 1000) by default.
+    // Never move any process by default.
     //
-    // User processes live in logind session scopes and use session-scoped
-    // sockets/D-Bus for IPC. Moving ANY of them breaks audio, settings
-    // daemons, volume controls, browsers, and any other session service.
+    // uid >= 1000 (real users): stay in their session scope — moving breaks
+    // session-scoped IPC (audio, settings, browsers, volume controls).
+    // Named rules (50-background.toml etc.) handle the specific processes
+    // that should be moved (package managers, build tools, etc.).
     //
-    // Named rules in the rules/ directory handle the specific user processes
-    // that SHOULD be moved (package managers, build tools, etc.) explicitly.
-    // Everything else stays where the session manager placed it.
-    if proc.uid >= 1000 {
-        return None;
-    }
-
-    // For uid=0 and system service accounts (uid 1-999): classify by origin.
-    // Real system services go to the system tier. Kernel threads are skipped.
-    match &proc.session_origin {
-        SessionOrigin::SystemService   => Some("system".into()),
-        SessionOrigin::UserService     => Some("system".into()),
-        // uid<1000 in a user interactive session = sudo child, polkit helper etc.
-        SessionOrigin::UserInteractive => Some("system".into()),
-        SessionOrigin::Unknown         => Some("system".into()),
-        SessionOrigin::KernelThread    => None,
-        #[allow(unreachable_patterns)]
-        _                              => Some("system".into()),
-    }
+    // uid 0-999 (root and system accounts): stay where the init system placed
+    // them. Moving login managers, TTY handlers, session supervisors, or any
+    // other uid=0 process breaks session management on every init system.
+    // Named rules handle the specific system daemons we want to throttle.
+    //
+    // The default classifier's job is to do nothing. Named rules do the work.
+    None
 }
 
 // ---------------------------------------------------------------------------

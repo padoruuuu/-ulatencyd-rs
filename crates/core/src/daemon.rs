@@ -342,25 +342,8 @@ impl Daemon {
             return;
         }
 
-        // Kernel threads — never touch.
+        // Kernel threads — no exe, never touch.
         if info.is_kernel_thread {
-            self.table.mark_classified(pid);
-            return;
-        }
-
-        // Skip transient root processes that exit in milliseconds.
-        // Doing cgroup writes for them is pure overhead with no benefit.
-        // User-space shells (uid > 0) are real interactive processes and
-        // should still be classified.
-        let is_transient_root = info.uid == 0 && matches!(info.comm.as_str(),
-            "(sd-close)" | "(sd-pam)" | "(agetty)" |
-            "bash" | "sh" | "dash" |
-            "cp" | "mv" | "ln" | "rm" | "mkdir" | "rmdir" |
-            "install" | "realpath" | "dirname" | "basename" |
-            "test" | "true" | "false" | "cat" | "echo" | "printf" |
-            "chmod" | "chown" | "touch" | "grep" | "sed" | "awk"
-        );
-        if is_transient_root {
             self.table.mark_classified(pid);
             return;
         }
@@ -416,14 +399,7 @@ impl Daemon {
                 }
             }
             None => {
-                let is_transient = matches!(info.comm.as_str(),
-                    "bash" | "sh" | "dash" | "zsh" | "fish" |
-                    "cp"   | "mv" | "ln"   | "rm"  | "mkdir" |
-                    "install" | "realpath" | "dirname" | "basename" |
-                    "test" | "true" | "false" | "cat" | "echo" | "printf" |
-                    "(sd-close)" | "(sd-pam)"
-                );
-                if !info.is_kernel_thread && !is_transient {
+                if !info.is_kernel_thread {
                     diag!("NO_RULE", "pid={} comm={:?} uid={} origin={:?}",
                         pid, info.comm, info.uid, info.session_origin);
                 }
@@ -556,22 +532,16 @@ impl Daemon {
         crate::diag::diag_section("SHUTDOWN");
 
         let moved = self.table.moved_pids();
-        let mut restored = 0usize;
 
-        // Cap restore at 2s — during system shutdown, session cgroup paths
-        // may already be gone (logind cleaned them up). TimeoutStopSec=5
-        // is the final backstop if this still somehow hangs.
         let restore_result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             async {
                 let mut n = 0usize;
                 for (pid, original) in &moved {
                     let Some(ref orig_path) = original else { continue; };
-                    // Skip if process already dead.
                     if !std::path::Path::new(&format!("/proc/{}", pid)).exists() {
                         continue;
                     }
-                    // Skip if target cgroup path no longer exists.
                     let procs = format!("/sys/fs/cgroup{}/cgroup.procs", orig_path);
                     if !std::path::Path::new(&procs).exists() {
                         debug!("teardown: original cgroup gone for pid {}: {}", pid, orig_path);
@@ -584,7 +554,7 @@ impl Daemon {
             }
         ).await;
 
-        restored = restore_result.unwrap_or_else(|_| {
+        let restored = restore_result.unwrap_or_else(|_| {
             info!("teardown: restore timed out");
             0
         });
