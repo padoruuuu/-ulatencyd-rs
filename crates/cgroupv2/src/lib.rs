@@ -352,31 +352,16 @@ impl CgroupManager {
 // ---------------------------------------------------------------------------
 
 /// Initialise the cgroup root at /sys/fs/cgroup/ulatencyd.
-///
-/// Used on ALL init systems (systemd, runit, s6, OpenRC).
-/// We deliberately never use the systemd service unit's own cgroup as our
-/// root — if we did, systemd would kill managed user processes when the
-/// daemon stops or restarts. /sys/fs/cgroup/ulatencyd is outside the
-/// service's scope so managed processes survive daemon restarts cleanly.
+/// Does NOT write to the root cgroup.subtree_control — that is owned by the
+/// system's session manager (elogind/systemd-logind). Writing to it disrupts
+/// their cgroup delegation and causes elogind to crash on runit systems.
+/// Controllers are enabled in our own subtree by CgroupManager::setup_hierarchy.
 pub async fn setup_direct_root() -> Result<PathBuf> {
     let root = PathBuf::from("/sys/fs/cgroup/ulatencyd");
     fs::create_dir_all(&root)
         .await
         .with_context(|| format!("create {}", root.display()))?;
-
-    // Enable controllers in the unified root's subtree_control.
-    enable_controllers_in("/sys/fs/cgroup/cgroup.subtree_control", &["cpu", "memory", "io", "cpuset"]).await;
-
     Ok(root)
-}
-
-/// Enable controllers by writing "+controller" tokens.
-async fn enable_controllers_in(path: &str, controllers: &[&str]) {
-    for ctrl in controllers {
-        if let Err(e) = fs::write(path, format!("+{}\n", ctrl)).await {
-            debug!("enable_controllers: {} += {}: {}", path, ctrl, e);
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

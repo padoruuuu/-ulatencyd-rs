@@ -178,19 +178,20 @@ async fn main() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Init-system-agnostic cgroup root setup.
-/// Tries /sys/fs/cgroup/ulatencyd first (runit/s6/OpenRC/manual).
-/// Falls back to the delegated service cgroup (systemd Delegate=yes).
+/// Tries /sys/fs/cgroup/ulatencyd first (runit/s6/OpenRC/manual root).
+/// Falls back to the delegated service cgroup on permission denied
+/// (systemd service namespace with ProtectSystem=strict).
+///
+/// We do NOT write to the root /sys/fs/cgroup/cgroup.subtree_control.
+/// That file is owned by the system's session manager (elogind, systemd-logind
+/// etc.). Writing to it disrupts their cgroup delegation and causes elogind
+/// to crash-loop on runit. Our own tier cgroups get their controllers enabled
+/// by CgroupManager::setup_hierarchy which writes to our own subtree only.
 async fn setup_cgroup_root() -> Result<PathBuf> {
     let direct = PathBuf::from("/sys/fs/cgroup/ulatencyd");
 
-    // Try direct creation first.
     match tokio::fs::create_dir_all(&direct).await {
         Ok(_) => {
-            // Enable controllers in parent.
-            let _ = tokio::fs::write(
-                "/sys/fs/cgroup/cgroup.subtree_control",
-                "+cpu +memory +io\n",
-            ).await;
             tracing::info!("cgroup root: {}", direct.display());
             return Ok(direct);
         }
@@ -198,7 +199,7 @@ async fn setup_cgroup_root() -> Result<PathBuf> {
             tracing::debug!("direct cgroup root denied, trying delegated path");
         }
         Err(e) => {
-            tracing::warn!("create_dir_all {}: {} — trying delegated path", direct.display(), e);
+            tracing::warn!("create {}: {} — trying delegated path", direct.display(), e);
         }
     }
 

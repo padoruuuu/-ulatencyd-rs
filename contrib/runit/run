@@ -1,3 +1,19 @@
 #!/bin/sh
 # /etc/runit/sv/ulatencyd/run
+
+# Wait for D-Bus to be available — without it the daemon runs fine but
+# the D-Bus service won't be registered (ulatencyctl will fail).
+# We detect D-Bus by the presence of its socket, not by name, so this
+# works on any distro regardless of dbus-daemon vs dbus-broker.
+_dbus_socket="/run/dbus/system_bus_socket"
+_waited=0
+while [ ! -S "$_dbus_socket" ]; do
+    if [ "$_waited" -ge 30 ]; then
+        echo "ulatencyd: D-Bus socket not found after 30s, starting anyway"
+        break
+    fi
+    sleep 1
+    _waited=$((_waited + 1))
+done
+
 exec /usr/sbin/ulatencyd 2>&1

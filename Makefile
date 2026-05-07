@@ -55,6 +55,12 @@ install-config:
 install-dbus:
 	install -Dm644 $(SRCDIR)contrib/dbus/org.ulatencyd.Ulatencyd1.conf \
 	    $(DBUSDIR)/org.ulatencyd.Ulatencyd1.conf
+	@# Reload dbus-daemon so it picks up the new policy without a reboot.
+	@if pidof dbus-daemon >/dev/null 2>&1; then \
+	    kill -HUP $$(pidof dbus-daemon) && echo "reloaded dbus-daemon"; \
+	elif pidof dbus-broker >/dev/null 2>&1; then \
+	    echo "dbus-broker: reload via your init system if ulatencyctl fails"; \
+	fi
 
 install-polkit:
 	install -Dm644 $(SRCDIR)contrib/polkit/rs.ulatencyd.policy \
