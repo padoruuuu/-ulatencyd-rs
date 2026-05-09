@@ -399,7 +399,10 @@ impl Daemon {
                 }
             }
             None => {
-                if !info.is_kernel_thread {
+                // Only log NO_RULE for user processes — uid=0 system/init
+                // helpers are never moved so they add no actionable information
+                // and flood the log (runsv, svlogd, tput, etc. on runit).
+                if !info.is_kernel_thread && info.uid >= 1000 {
                     diag!("NO_RULE", "pid={} comm={:?} uid={} origin={:?}",
                         pid, info.comm, info.uid, info.session_origin);
                 }

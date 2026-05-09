@@ -12,6 +12,7 @@
 
 use std::collections::HashSet;
 use tracing::{debug, info};
+use libc;
 
 use cgroupv2::{CgroupManager, CgroupTier};
 
@@ -113,32 +114,44 @@ impl ForegroundTracker {
         );
 
         // Demote previous foreground pids not in the new set.
+        // Nice is restored to 0 (CFS normal). Cgroup move to System only
+        // applies to processes we originally moved (not session-scoped ones).
         let to_demote: Vec<u32> = self.current_pids
             .difference(&new_pids)
             .copied()
             .collect();
-        for pid in &to_demote {
-            if let Err(e) = cgmgr.assign_pid(Some(CgroupTier::System), *pid).await {
+        for &pid in &to_demote {
+            // Restore nice to 0 unconditionally — this is safe for any process.
+            set_nice(pid, 0);
+            if let Err(e) = cgmgr.assign_pid(Some(CgroupTier::System), pid).await {
                 debug!("demote pid {}: {}", pid, e);
             }
         }
         if !to_demote.is_empty() {
-            debug!("demoted {} pids → system", to_demote.len());
+            debug!("demoted {} pids → system (nice=0)", to_demote.len());
         }
 
         // Promote new foreground pids.
+        // Apply nice=-5 (same as system76-scheduler) regardless of whether
+        // the cgroup move succeeds — session-scoped processes stay in their
+        // session cgroup but still get the scheduling boost.
         for &pid in &new_pids {
+            set_nice(pid, -5);
             if let Err(e) = cgmgr.assign_pid(Some(CgroupTier::Interactive), pid).await {
                 debug!("promote pid {}: {}", pid, e);
             }
         }
+        debug!("boosted {} pids (nice=-5)", new_pids.len());
 
         self.current_pids = new_pids;
         self.current_root = Some(app_root);
     }
 
     pub fn on_exit(&mut self, pid: u32) {
-        self.current_pids.remove(&pid);
+        if self.current_pids.remove(&pid) {
+            // Best-effort nice restore — process may already be gone.
+            set_nice(pid, 0);
+        }
     }
 }
 
@@ -192,7 +205,17 @@ fn find_app_root(pid: u32, table: &ProcessTable) -> Option<u32> {
     }
 }
 
-/// BFS-collect all descendants of root, including root itself.
+/// Set the nice level for a pid. Safe to call on any pid including
+/// session-scoped processes — nice adjustments don't require cgroup membership.
+fn set_nice(pid: u32, nice: i8) {
+    unsafe {
+        libc::setpriority(
+            libc::PRIO_PROCESS,
+            pid as libc::id_t,
+            nice as libc::c_int,
+        );
+    }
+}
 fn collect_tree(root: u32, table: &ProcessTable) -> HashSet<u32> {
     let mut result = HashSet::new();
     let mut queue  = vec![root];

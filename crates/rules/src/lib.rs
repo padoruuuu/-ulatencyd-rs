@@ -53,13 +53,17 @@ pub struct MatchToml {
     #[serde(default)] pub comm_prefix:         Vec<String>,
     #[serde(default)] pub cmdline_contains:    Vec<String>,
     #[serde(default)] pub exe_path:            Vec<String>,
+    /// Exact uid values to match.
     #[serde(default)] pub uid:                 Vec<u32>,
+    /// Minimum uid (inclusive). Use uid_max=999 to match only system users.
+    pub uid_min:       Option<u32>,
+    /// Maximum uid (inclusive). Use uid_min=1000 to match only real users.
+    pub uid_max:       Option<u32>,
     #[serde(default)] pub env_set:             Vec<String>,
     pub min_threads:   Option<u32>,
     pub min_rss_mb:    Option<u64>,
     #[serde(default)] pub parent_comm:         Vec<String>,
     #[serde(default)] pub cgroup_path_contains: Vec<String>,
-    /// Wildmatch glob, e.g. "/user.slice/*.service"
     pub cgroup_path:   Option<String>,
 }
 
@@ -108,14 +112,14 @@ pub struct Matchers {
     pub cmdline_contains:    Vec<String>,
     pub exe_path:            Vec<PathBuf>,
     pub uid:                 Vec<u32>,
+    pub uid_min:             Option<u32>,
+    pub uid_max:             Option<u32>,
     pub env_set:             Vec<String>,
     pub min_threads:         Option<u32>,
     pub min_rss_mb:          Option<u64>,
     pub parent_comm:         Vec<String>,
     pub cgroup_path_contains: Vec<String>,
-    /// Pre-compiled wildmatch pattern (only when pattern contains * or ?).
     pub cgroup_path_glob:    Option<(String, WildMatch)>,
-    /// Exact cgroup path (no glob characters).
     pub cgroup_path_exact:   Option<String>,
 }
 
@@ -141,6 +145,12 @@ impl Matchers {
         }
         if !self.uid.is_empty() && !self.uid.contains(&proc.uid) {
             return false;
+        }
+        if let Some(min) = self.uid_min {
+            if proc.uid < min { return false; }
+        }
+        if let Some(max) = self.uid_max {
+            if proc.uid > max { return false; }
         }
         if !self.env_set.is_empty() {
             if !self.env_set.iter().all(|k| proc.environ.contains_key(k.as_str())) {
@@ -383,7 +393,7 @@ impl RuleEngine {
 ///   uid > 0, UserService                     → system
 ///   uid = 0, SystemService                   → system
 ///   uid = 0, UserInteractive (su/sudo child) → system
-fn default_cgroup_for(proc: &procmon::ProcessInfo) -> Option<String> {
+fn default_cgroup_for(_proc: &procmon::ProcessInfo) -> Option<String> {
     // Never move any process by default.
     //
     // uid >= 1000 (real users): stay in their session scope — moving breaks
@@ -482,6 +492,8 @@ fn compile_rule(r: RuleToml, _profiles: &HashMap<String, ActionToml>) -> Result<
         cmdline_contains:     m.cmdline_contains.clone(),
         exe_path:             m.exe_path.iter().map(PathBuf::from).collect(),
         uid:                  m.uid.clone(),
+        uid_min:              m.uid_min,
+        uid_max:              m.uid_max,
         env_set:              m.env_set.clone(),
         min_threads:          m.min_threads,
         min_rss_mb:           m.min_rss_mb,

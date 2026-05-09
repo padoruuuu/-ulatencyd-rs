@@ -1,93 +1,125 @@
 # rules/50-background.toml
-# Background and idle processes.
+# Background and idle process throttling.
+#
+# IMPORTANT: Rules that use sched_policy="idle" or sched_policy="batch" are
+# restricted to uid_max=999 (system service accounts). These scheduling
+# policies cause processes to only run when nothing else wants CPU — safe
+# for system maintenance tasks but will stall user session processes that
+# happen to call the same tools (find, grep etc. in XFCE/KDE init scripts).
+#
+# For user-initiated builds and tools (uid >= 1000), we use nice levels only,
+# which throttle without starvation.
+
+# Package managers — system (uid=0) or user invoking them directly.
+# Split into two rules: system gets SCHED_IDLE, user gets nice only.
 
 [[rule]]
-name     = "package-managers"
-priority = 50
+name     = "package-manager-system"
+priority = 70
 
 [rule.match]
-comm = ["apt", "apt-get", "dpkg", "rpm", "pacman", "yum", "dnf",
-        "zypper", "xbps-install", "emerge", "portage"]
+comm     = ["pacman", "apt", "apt-get", "dpkg", "dnf", "yum", "zypper",
+            "emerge", "xbps-install", "apk", "pip", "pip3", "npm", "yarn",
+            "paru", "yay", "aura", "trizen", "pikaur"]
+uid_max  = 999
+
+[rule.action]
+cgroup        = "background"
+nice          = 15
+io_weight     = 50
+sched_policy  = "batch"
+oom_score_adj = 300
+
+[[rule]]
+name     = "package-manager-user"
+priority = 69
+
+[rule.match]
+comm     = ["pacman", "apt", "apt-get", "dpkg", "dnf", "yum", "zypper",
+            "emerge", "xbps-install", "apk", "pip", "pip3", "npm", "yarn",
+            "paru", "yay", "aura", "trizen", "pikaur"]
+uid_min  = 1000
 
 [rule.action]
 cgroup        = "background"
 nice          = 10
 io_weight     = 50
-oom_score_adj = 500
-apply_to_children = true
+oom_score_adj = 300
+
+# Build tools — same split.
 
 [[rule]]
-name     = "package-manager-build"
-priority = 50
+name     = "build-tools-system"
+priority = 65
 
 [rule.match]
-parent_comm = ["apt", "dpkg", "pacman", "portage", "emerge"]
+comm    = ["make", "cmake", "ninja", "meson", "cargo", "rustc",
+           "gcc", "g++", "cc", "c++", "clang", "clang++",
+           "ld", "lld", "mold", "gold", "ar", "ranlib",
+           "go", "javac", "mvn", "gradle", "ant",
+           "webpack", "rollup", "vite", "tsc",
+           "cc1", "cc1plus", "collect2"]
+uid_max = 999
+
+[rule.action]
+cgroup       = "background"
+nice         = 15
+io_weight    = 50
+sched_policy = "batch"
+
+[[rule]]
+name     = "build-tools-user"
+priority = 64
+
+[rule.match]
+comm    = ["make", "cmake", "ninja", "meson", "cargo", "rustc",
+           "gcc", "g++", "cc", "c++", "clang", "clang++",
+           "ld", "lld", "mold", "gold", "ar", "ranlib",
+           "go", "javac", "mvn", "gradle", "ant",
+           "webpack", "rollup", "vite", "tsc",
+           "cc1", "cc1plus", "collect2"]
+uid_min = 1000
 
 [rule.action]
 cgroup    = "background"
-nice      = 15
+nice      = 10
 io_weight = 50
 
-[[rule]]
-name     = "updatedb-mlocate"
-priority = 50
-
-[rule.match]
-comm = ["updatedb", "mlocate", "plocate"]
-
-[rule.action]
-cgroup        = "idle"
-nice          = 19
-io_weight     = 10
-sched_policy  = "idle"
+# Disk-intensive system maintenance — ONLY for system users.
+# find/grep/locate are also used by session startup scripts (XFCE, KDE etc.),
+# so we MUST NOT apply SCHED_IDLE to uid>=1000 or session services stall.
 
 [[rule]]
-name     = "backup-tools"
-priority = 50
-
-[rule.match]
-comm = ["rsync", "borg", "rclone", "duplicati", "restic", "bup"]
-
-[rule.action]
-cgroup    = "background"
-nice      = 15
-io_weight = 50
-
-[[rule]]
-name     = "virus-scanners"
-priority = 50
-
-[rule.match]
-comm = ["clamd", "freshclam", "clamdscan", "clamscan"]
-
-[rule.action]
-cgroup       = "idle"
-nice         = 19
-sched_policy = "idle"
-io_weight    = 10
-
-[[rule]]
-name     = "build-systems"
-priority = 50
-
-[rule.match]
-comm = ["make", "cmake", "ninja", "cargo", "rustc", "gcc", "g++",
-        "clang", "clang++", "cc1", "cc1plus", "as", "ld"]
-
-[rule.action]
-cgroup = "background"
-nice   = 10
-
-[[rule]]
-name     = "disk-intensive-idle"
+name     = "disk-intensive-system"
 priority = 45
 
 [rule.match]
-comm = ["find", "grep", "locate", "fd"]
-min_rss_mb = 0
+comm    = ["find", "grep", "locate", "mlocate", "plocate",
+           "fd", "rg", "ripgrep", "updatedb",
+           "rsync", "rclone", "borg", "restic", "duplicati",
+           "fsck", "e2fsck", "xfs_repair", "btrfs",
+           "dd", "pv", "tar", "gzip", "bzip2", "xz", "zstd",
+           "mkfs", "mkfs.ext4", "mkfs.xfs", "mkfs.btrfs"]
+uid_max = 999
 
 [rule.action]
 cgroup       = "idle"
 nice         = 19
-sched_policy = "idle"
 io_weight    = 10
+sched_policy = "idle"
+
+# Backup and sync for user — nice throttle only, no starvation policy.
+
+[[rule]]
+name     = "disk-intensive-user"
+priority = 44
+
+[rule.match]
+comm    = ["rsync", "rclone", "borg", "restic",
+           "tar", "gzip", "bzip2", "xz", "zstd"]
+uid_min = 1000
+
+[rule.action]
+cgroup    = "background"
+nice      = 15
+io_weight = 30
