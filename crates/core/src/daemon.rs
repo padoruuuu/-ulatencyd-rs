@@ -239,10 +239,16 @@ impl Daemon {
 
                 match ProcessInfo::from_pid(child_pid) {
                     Ok(info) => {
-                        self.table.insert(info.clone());
-                        // classify_and_apply checks ancestor chain — bwrap/sandbox
-                        // children are automatically exempt via ExceptionList.
-                        self.classify_and_apply(child_pid, &info, dbus_conn).await;
+                        self.table.insert(info);
+                        // Do NOT classify at fork time. The child still has
+                        // the parent's comm and hasn't exec'd its real binary
+                        // yet. Classifying here applies the parent's rules to
+                        // the child — e.g. sway forks a child that becomes
+                        // xfce4-taskmand, but we'd apply compositor oom=-1000
+                        // to it before it execs, and oom_score_adj persists
+                        // across exec, potentially breaking the service.
+                        // Classification happens correctly at EXEC instead.
+                        self.table.mark_classified(child_pid);
                     }
                     Err(e) => debug!("fork pid {} vanished: {}", child_pid, e),
                 }
