@@ -188,32 +188,11 @@ async fn main() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Init-system-agnostic cgroup root setup.
-/// Tries /sys/fs/cgroup/ulatencyd first (runit/s6/OpenRC/manual root).
-/// Falls back to the delegated service cgroup on permission denied
-/// (systemd service namespace with ProtectSystem=strict).
-///
-/// We do NOT write to the root /sys/fs/cgroup/cgroup.subtree_control.
-/// That file is owned by the system's session manager (elogind, systemd-logind
-/// etc.). Writing to it disrupts their cgroup delegation and causes elogind
-/// to crash-loop on runit. Our own tier cgroups get their controllers enabled
-/// by CgroupManager::setup_hierarchy which writes to our own subtree only.
+/// Always uses the delegated cgroup from /proc/self/cgroup.
+/// Never creates a top-level directory under /sys/fs/cgroup to avoid
+/// interfering with session managers (elogind, systemd-logind) that
+/// own the cgroup hierarchy.
 async fn setup_cgroup_root() -> Result<PathBuf> {
-    let direct = PathBuf::from("/sys/fs/cgroup/ulatencyd");
-
-    match tokio::fs::create_dir_all(&direct).await {
-        Ok(_) => {
-            tracing::info!("cgroup root: {}", direct.display());
-            return Ok(direct);
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            tracing::debug!("direct cgroup root denied, trying delegated path");
-        }
-        Err(e) => {
-            tracing::warn!("create {}: {} — trying delegated path", direct.display(), e);
-        }
-    }
-
-    // Fall back to delegated service cgroup (systemd Delegate=yes).
     let content = tokio::fs::read_to_string("/proc/self/cgroup").await
         .context("read /proc/self/cgroup")?;
 
