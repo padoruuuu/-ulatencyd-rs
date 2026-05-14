@@ -49,6 +49,8 @@ pub struct Daemon {
     forkbomb: ForkBombDetector,
     focus:    ForegroundTracker,
     state:    Arc<Mutex<SharedState>>,
+    startup_deadline: tokio::time::Instant,
+    startup_phase:    bool,
 }
 
 impl Daemon {
@@ -73,6 +75,8 @@ impl Daemon {
             forkbomb,
             focus: ForegroundTracker::new(),
             state,
+            startup_deadline: tokio::time::Instant::now(),
+            startup_phase:    true,
         })
     }
 
@@ -125,9 +129,25 @@ impl Daemon {
             self.do_full_scan(&dbus_conn).await;
         }
 
+        // Startup grace period: during the first 30 seconds after launch,
+        // no process classification or cgroup moves are applied. This
+        // prevents interfering with session startup on non-systemd init
+        // systems (runit, s6, OpenRC) where the daemon may start before
+        // the graphical session is fully initialised.
+        const STARTUP_GRACE_SECS: u64 = 30;
+        self.startup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(STARTUP_GRACE_SECS);
+        self.startup_phase = true;
+        info!("entering startup grace period ({}s)", STARTUP_GRACE_SECS);
+
         info!("event loop started");
 
         loop {
+            // End of startup grace period — enable classification.
+            if self.startup_phase && tokio::time::Instant::now() >= self.startup_deadline {
+                info!("startup grace period ended; enabling full classification");
+                self.startup_phase = false;
+                self.do_full_scan(&dbus_conn).await;
+            }
             tokio::select! {
                 // Netlink proc event.
                 event = proc_monitor.next_event() => {
@@ -261,7 +281,11 @@ impl Daemon {
                         // Insert resets classified=false, so the new comm/exe
                         // goes through the rule engine fresh.
                         self.table.insert(info.clone());
-                        self.classify_and_apply(pid, &info, dbus_conn).await;
+                        if !self.startup_phase {
+                            self.classify_and_apply(pid, &info, dbus_conn).await;
+                        } else {
+                            debug!("startup phase: defer classification for pid {}", pid);
+                        }
                     }
                     Err(e) => debug!("exec pid {} vanished: {}", pid, e),
                 }
@@ -285,7 +309,11 @@ impl Daemon {
                     match ProcessInfo::from_pid(pid) {
                         Ok(info) => {
                             self.table.insert(info.clone());
-                            self.classify_and_apply(pid, &info, dbus_conn).await;
+                            if !self.startup_phase {
+                                self.classify_and_apply(pid, &info, dbus_conn).await;
+                            } else {
+                                debug!("startup phase: defer classification for pid {}", pid);
+                            }
                         }
                         Err(_) => {}
                     }
@@ -305,6 +333,10 @@ impl Daemon {
     ) {
         match cmd {
             DbusCommand::SetForegroundProcess(pid) => {
+                if self.startup_phase {
+                    info!("ignoring SetForegroundProcess during startup (pid={})", pid);
+                    return;
+                }
                 info!("foreground pid → {}", pid);
                 self.state.lock().await.foreground_pid = Some(pid);
                 self.focus.set_foreground(pid, &self.table, &self.cgmgr).await;
@@ -448,15 +480,22 @@ impl Daemon {
         // Suppress D-Bus signals during bulk classification — emitting hundreds
         // of signals at boot floods the bus and slows startup significantly.
         // Signals are still emitted for individual process events after startup.
-        let bulk = unclassified.len() > 10;
-        for pid in unclassified {
-            if let Some(proc_info) = self.table.get(pid).map(|e| e.info.clone()) {
-                self.classify_and_apply(
-                    pid,
-                    &proc_info,
-                    if bulk { &None } else { dbus_conn },
-                ).await;
+        if !self.startup_phase {
+            let bulk = unclassified.len() > 10;
+            for pid in unclassified {
+                if let Some(proc_info) = self.table.get(pid).map(|e| e.info.clone()) {
+                    self.classify_and_apply(
+                        pid,
+                        &proc_info,
+                        if bulk { &None } else { dbus_conn },
+                    ).await;
+                }
             }
+        } else {
+            tracing::info!(
+                "startup phase: deferring classification of {} processes",
+                unclassified.len()
+            );
         }
     }
 

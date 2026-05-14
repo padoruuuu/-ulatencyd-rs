@@ -41,5 +41,11 @@ pub fn scan_proc() -> Vec<ProcessInfo> {
 /// Check if a PID is still alive without reading its full info.
 /// Faster than ProcessInfo::from_pid for GC sweeps.
 pub fn pid_exists(pid: u32) -> bool {
-    Path::new(&format!("/proc/{}", pid)).exists()
+// Use itoa for stack-allocated integer formatting, avoiding allocation.
+let mut buf = itoa::Buffer::new();
+let pid_str = buf.format(pid);
+let mut path_buf = std::path::PathBuf::with_capacity(16);
+path_buf.push("/proc");
+path_buf.push(pid_str);
+path_buf.exists()
 }

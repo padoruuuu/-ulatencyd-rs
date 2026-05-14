@@ -124,10 +124,20 @@ async fn main() -> Result<()> {
 
     // D-Bus service.
     let (dbus_conn, dbus_rx) = if config.dbus.enabled {
-        match start_dbus_service(Arc::clone(&state)).await {
-            Ok((conn, rx)) => (Some(conn), rx),
-            Err(e) => {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            start_dbus_service(Arc::clone(&state)),
+        )
+        .await
+        {
+            Ok(Ok((conn, rx))) => (Some(conn), rx),
+            Ok(Err(e)) => {
                 tracing::warn!("D-Bus service failed to start: {} (continuing without)", e);
+                let (_, rx) = tokio::sync::mpsc::channel(1);
+                (None, rx)
+            }
+            Err(_) => {
+                tracing::warn!("D-Bus service start timed out (continuing without)");
                 let (_, rx) = tokio::sync::mpsc::channel(1);
                 (None, rx)
             }
