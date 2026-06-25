@@ -34,7 +34,8 @@ use crate::init::InitSystem;
 use crate::process_table::ProcessTable;
 use crate::sched::{
     AutogroupGuard, PowerState, apply_sched_profile,
-    monitor_power_state, CONSERVATIVE, RESPONSIVE,
+    monitor_power_state, probe_preempt_model_switchable, probe_sched_latency_ns,
+    CONSERVATIVE, RESPONSIVE,
 };
 use crate::signal::ShutdownToken;
 
@@ -52,6 +53,15 @@ pub struct Daemon {
     state:    Arc<Mutex<SharedState>>,
     startup_deadline: tokio::time::Instant,
     startup_phase:    bool,
+    /// Probed once at startup: true on CFS kernels (< 6.6), false on EEVDF.
+    sched_latency_ns_available: bool,
+    /// Probed once at startup: true when the kernel supports runtime preempt
+    /// model switching (CONFIG_PREEMPT_DYNAMIC and no sched_ext active).
+    preempt_switchable: bool,
+    /// Last observed power source; used to detect real AC↔battery transitions
+    /// and suppress spurious handler invocations when the polled value is
+    /// unchanged.
+    last_power_source: Option<PowerState>,
 }
 
 impl Daemon {
@@ -87,6 +97,21 @@ impl Daemon {
             grace_secs, init_system
         );
 
+        // Probe once: sched_latency_ns availability (CFS vs EEVDF kernel).
+        let sched_latency_ns_available = probe_sched_latency_ns();
+        if !sched_latency_ns_available {
+            info!(
+                "sched_latency_ns absent (kernel ≥ 6.6, EEVDF); \
+                 using sched_min_granularity_ns + sched_wakeup_granularity_ns instead"
+            );
+        }
+
+        // Probe once: preempt model switchability.
+        let preempt_switchable = probe_preempt_model_switchable();
+        if !preempt_switchable {
+            info!("preempt model switching unavailable (fixed kernel or sched_ext active); skipping");
+        }
+
         Ok(Self {
             config,
             cgmgr,
@@ -97,6 +122,9 @@ impl Daemon {
             state,
             startup_deadline,
             startup_phase: true,
+            sched_latency_ns_available,
+            preempt_switchable,
+            last_power_source: None,
         })
     }
 
@@ -125,13 +153,14 @@ impl Daemon {
 
         // Power state monitor.
         let mut power_rx = monitor_power_state().await;
-        let mut current_power = *power_rx.borrow();
-        let profile = if current_power == PowerState::Battery {
+        let initial_power = *power_rx.borrow();
+        self.last_power_source = Some(initial_power);
+        let profile = if initial_power == PowerState::Battery {
             &CONSERVATIVE
         } else {
             &RESPONSIVE
         };
-        apply_sched_profile(profile);
+        apply_sched_profile(profile, self.sched_latency_ns_available, self.preempt_switchable);
 
         // Timers.
         let rescan_interval = Duration::from_secs(self.config.daemon.rescan_interval_secs);
@@ -223,15 +252,23 @@ impl Daemon {
 
                 // Power state change.
                 _ = power_rx.changed() => {
-                    current_power = *power_rx.borrow();
-                    let profile = if current_power == PowerState::Battery {
-                        info!("switched to battery power");
-                        &CONSERVATIVE
-                    } else {
-                        info!("switched to AC power");
-                        &RESPONSIVE
-                    };
-                    apply_sched_profile(profile);
+                    let new_source = *power_rx.borrow_and_update();
+                    if self.last_power_source != Some(new_source) {
+                        let prev = self.last_power_source.replace(new_source);
+                        if let Some(p) = prev {
+                            info!("power source: {:?} → {:?}", p, new_source);
+                        }
+                        let profile = if new_source == PowerState::Battery {
+                            &CONSERVATIVE
+                        } else {
+                            &RESPONSIVE
+                        };
+                        apply_sched_profile(
+                            profile,
+                            self.sched_latency_ns_available,
+                            self.preempt_switchable,
+                        );
+                    }
                 }
 
                 // Periodic full rescan.
