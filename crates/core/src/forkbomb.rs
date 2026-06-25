@@ -146,10 +146,21 @@ impl ForkBombDetector {
     }
 
     /// Evict stale entries from the window map (call on GC timer).
+    /// Also clears the throttled set for any PID whose fork window has gone
+    /// cold — prevents monotonic growth and allows PID-reuse correctness.
     pub fn gc(&mut self) {
         let cutoff = Instant::now() - Duration::from_secs(10);
-        self.windows.retain(|_, w| {
-            w.timestamps.back().map_or(false, |&t| t >= cutoff)
-        });
+        // Collect PIDs whose windows are stale before mutably borrowing windows.
+        let stale: Vec<u32> = self.windows
+            .iter()
+            .filter(|(_, w)| w.timestamps.back().map_or(true, |&t| t < cutoff))
+            .map(|(&pid, _)| pid)
+            .collect();
+        for pid in &stale {
+            self.windows.remove(pid);
+            // Bug 2 fix: remove from throttled so PID reuse works correctly
+            // and the set doesn't grow without bound.
+            self.throttled.remove(pid);
+        }
     }
 }

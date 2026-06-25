@@ -138,10 +138,26 @@ impl UlatencydInterface {
     async fn get_system_pressure(&self) -> HashMap<String, f64> {
         let p = self.state.lock().await.pressure;
         let mut m = HashMap::new();
-        m.insert("memory_some_avg10".into(), p.memory.some_avg10 as f64);
-        m.insert("memory_some_avg60".into(), p.memory.some_avg60 as f64);
-        m.insert("io_some_avg10".into(),     p.io.some_avg10 as f64);
-        m.insert("cpu_some_avg10".into(),    p.cpu.some_avg10 as f64);
+        // Memory — some and full
+        m.insert("memory_some_avg10".into(),  p.memory.some_avg10  as f64);
+        m.insert("memory_some_avg60".into(),  p.memory.some_avg60  as f64);
+        m.insert("memory_some_avg300".into(), p.memory.some_avg300 as f64);
+        m.insert("memory_full_avg10".into(),  p.memory.full_avg10  as f64);
+        m.insert("memory_full_avg60".into(),  p.memory.full_avg60  as f64);
+        m.insert("memory_full_avg300".into(), p.memory.full_avg300 as f64);
+        // I/O — some and full
+        m.insert("io_some_avg10".into(),      p.io.some_avg10  as f64);
+        m.insert("io_some_avg60".into(),      p.io.some_avg60  as f64);
+        m.insert("io_some_avg300".into(),     p.io.some_avg300 as f64);
+        m.insert("io_full_avg10".into(),      p.io.full_avg10  as f64);
+        m.insert("io_full_avg60".into(),      p.io.full_avg60  as f64);
+        m.insert("io_full_avg300".into(),     p.io.full_avg300 as f64);
+        // CPU — some only.
+        // NOTE: /proc/pressure/cpu does not have a 'full' line on most kernels
+        // by design — CPU full stalls are not well-defined because there is
+        // always at least one runnable task.  cpu.full_avg10 from the PSI
+        // parser is 0.0; we omit it here to avoid misleading callers.
+        m.insert("cpu_some_avg10".into(),     p.cpu.some_avg10 as f64);
         m
     }
 

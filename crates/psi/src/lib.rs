@@ -149,37 +149,4 @@ Ok(m)
 // Parser
 // ---------------------------------------------------------------------------
 
-// Parse a /proc/pressure/* file.
-// Format (two lines for memory/io, one for cpu):
-// some avg10=0.00 avg60=0.00 avg300=0.00 total=0
-// full avg10=0.00 avg60=0.00 avg300=0.00 total=0
-///   some avg10=0.00 avg60=0.00 avg300=0.00 total=0
-///   full avg10=0.00 avg60=0.00 avg300=0.00 total=0
-fn read_psi(path: &str) -> Result<PsiMetrics> {
-let content = std::fs::read_to_string(path)
-.with_context(|| format!("read PSI {}", path))?;
 
-let mut m = PsiMetrics::default();
-for line in content.lines() {
-let mut iter = line.split_ascii_whitespace();
-let kind = iter.next().unwrap_or("");
-let mut avg10 = 0f32;
-let mut avg60 = 0f32;
-let mut avg300 = 0f32;
-for field in iter {
-if let Some(v) = field.strip_prefix("avg10=") {
-avg10 = v.parse().unwrap_or(0.0);
-} else if let Some(v) = field.strip_prefix("avg60=") {
-avg60 = v.parse().unwrap_or(0.0);
-} else if let Some(v) = field.strip_prefix("avg300=") {
-avg300 = v.parse().unwrap_or(0.0);
-}
-}
-match kind {
-"some" => { m.some_avg10 = avg10; m.some_avg60 = avg60; m.some_avg300 = avg300; }
-"full" => { m.full_avg10 = avg10; m.full_avg60 = avg60; m.full_avg300 = avg300; }
-_ => {}
-}
-}
-Ok(m)
-}

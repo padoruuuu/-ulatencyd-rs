@@ -76,7 +76,7 @@ pub async fn restore_cgroup(pid: u32, cgroup_path: &str) {
     }
 }
 
-fn set_nice(pid: u32, nice: i8) -> Result<()> {
+pub fn set_nice(pid: u32, nice: i8) -> Result<()> {
     let rc = unsafe {
         libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, nice as libc::c_int)
     };

@@ -12,7 +12,8 @@
 
 use std::collections::HashSet;
 use tracing::{debug, info};
-use libc;
+use futures_util::future::join_all;
+use crate::applier::set_nice;
 
 use cgroupv2::{CgroupManager, CgroupTier};
 
@@ -68,6 +69,13 @@ impl ForegroundTracker {
         Self { current_pids: HashSet::new(), current_root: None }
     }
 
+    /// Returns true if `pid` is currently boosted to interactive by the focus
+    /// tracker.  `classify_and_apply` uses this to skip re-classification of
+    /// foreground processes; their cgroup/nice placement is owned here.
+    pub fn is_foreground(&self, pid: u32) -> bool {
+        self.current_pids.contains(&pid)
+    }
+
     pub async fn set_foreground(
         &mut self,
         hint_pid: u32,
@@ -116,14 +124,20 @@ impl ForegroundTracker {
         // Demote previous foreground pids not in the new set.
         // Nice is restored to 0 (CFS normal). Cgroup move to System only
         // applies to processes we originally moved (not session-scoped ones).
+        // All cgroup writes are issued concurrently to avoid stalling the
+        // Tokio I/O pool when the old foreground tree was large.
         let to_demote: Vec<u32> = self.current_pids
             .difference(&new_pids)
             .copied()
             .collect();
-        for &pid in &to_demote {
-            // Restore nice to 0 unconditionally — this is safe for any process.
-            set_nice(pid, 0);
-            if let Err(e) = cgmgr.assign_pid(Some(CgroupTier::System), pid).await {
+        // set_nice is synchronous; fire it for all pids first, then
+        // issue all cgroup.procs writes in parallel via join_all.
+        let demote_futs: Vec<_> = to_demote.iter().map(|&pid| {
+            let _ = set_nice(pid, 0);
+            cgmgr.assign_pid(Some(CgroupTier::System), pid)
+        }).collect();
+        for (pid, result) in to_demote.iter().zip(join_all(demote_futs).await) {
+            if let Err(e) = result {
                 debug!("demote pid {}: {}", pid, e);
             }
         }
@@ -131,17 +145,23 @@ impl ForegroundTracker {
             debug!("demoted {} pids → system (nice=0)", to_demote.len());
         }
 
-        // Promote new foreground pids.
+        // Promote new foreground pids — parallelised.
         // Apply nice=-5 (same as system76-scheduler) regardless of whether
         // the cgroup move succeeds — session-scoped processes stay in their
         // session cgroup but still get the scheduling boost.
-        for &pid in &new_pids {
-            set_nice(pid, -5);
-            if let Err(e) = cgmgr.assign_pid(Some(CgroupTier::Interactive), pid).await {
+        // Browsers routinely have 30–60+ processes; sequential writes stall
+        // the Tokio I/O pool during the transition, causing a visible freeze.
+        let to_promote: Vec<u32> = new_pids.iter().copied().collect();
+        let promote_futs: Vec<_> = to_promote.iter().map(|&pid| {
+            let _ = set_nice(pid, -5);
+            cgmgr.assign_pid(Some(CgroupTier::Interactive), pid)
+        }).collect();
+        for (pid, result) in to_promote.iter().zip(join_all(promote_futs).await) {
+            if let Err(e) = result {
                 debug!("promote pid {}: {}", pid, e);
             }
         }
-        debug!("boosted {} pids (nice=-5)", new_pids.len());
+        debug!("boosted {} pids (nice=-5)", to_promote.len());
 
         self.current_pids = new_pids;
         self.current_root = Some(app_root);
@@ -150,7 +170,7 @@ impl ForegroundTracker {
     pub fn on_exit(&mut self, pid: u32) {
         if self.current_pids.remove(&pid) {
             // Best-effort nice restore — process may already be gone.
-            set_nice(pid, 0);
+            let _ = set_nice(pid, 0);
         }
     }
 }
@@ -205,17 +225,7 @@ fn find_app_root(pid: u32, table: &ProcessTable) -> Option<u32> {
     }
 }
 
-/// Set the nice level for a pid. Safe to call on any pid including
-/// session-scoped processes — nice adjustments don't require cgroup membership.
-fn set_nice(pid: u32, nice: i8) {
-    unsafe {
-        libc::setpriority(
-            libc::PRIO_PROCESS,
-            pid as libc::id_t,
-            nice as libc::c_int,
-        );
-    }
-}
+
 fn collect_tree(root: u32, table: &ProcessTable) -> HashSet<u32> {
     let mut result = HashSet::new();
     let mut queue  = vec![root];

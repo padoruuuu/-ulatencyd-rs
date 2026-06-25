@@ -30,7 +30,7 @@ use procmon::ProcMonitor;
 use config::Config;
 use daemon::Daemon;
 use diag::flush_diagnostic_log;
-use init::SupervisorNotify;
+use init::{Supervisor, SupervisorNotify};
 use signal::init_signals;
 
 // ---------------------------------------------------------------------------
@@ -99,15 +99,25 @@ async fn main() -> Result<()> {
         diag::disable_diagnostic_log();
     }
 
-    // Detect init system (used only for supervisor notification — not for cgroup setup).
+    // Detect init system (used for supervisor notification and for
+    // init-specific tuning such as the startup grace period).
     let notify = SupervisorNotify::detect();
+    let init_system = notify.init();
+
+    // Announce our PID so the supervisor can track us (systemd MAINPID=).
+    notify.mainpid(std::process::id());
+
+    // Extend the startup timeout — cgroup setup and D-Bus initialisation
+    // can take a few seconds on busy systems.
+    notify.extend_timeout(15_000_000); // 15 s
 
     // Set up cgroup hierarchy — init-system agnostic.
     //
-    // Try /sys/fs/cgroup/ulatencyd first (works on runit/s6/OpenRC and
-    // when run as root manually). If permission denied (running inside a
-    // systemd service namespace with ProtectSystem=strict), fall back to
-    // the delegated service cgroup from /proc/self/cgroup.
+    // On systemd with Delegate=yes we use the private subtree handed to us via
+    // /proc/self/cgroup.  On runit, s6, OpenRC, or when run as root manually,
+    // the daemon starts in the cgroupv2 root ("/"); in that case we fall back
+    // to creating /sys/fs/cgroup/ulatencyd directly so we never touch the root
+    // cgroup that belongs to the session manager (elogind/systemd-logind).
     //
     // Same binary, same code path, works on all init systems.
     let cgroup_root = setup_cgroup_root().await
@@ -168,7 +178,7 @@ async fn main() -> Result<()> {
     notify.status("initialising");
 
     // Build and run the daemon.
-    let daemon = Daemon::new(config, cgmgr, Arc::clone(&state))
+    let daemon = Daemon::new(config, cgmgr, Arc::clone(&state), init_system)
         .await
         .context("failed to initialise daemon")?;
 
@@ -187,15 +197,14 @@ async fn main() -> Result<()> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Init-system-agnostic cgroup root setup.
-/// Always uses the delegated cgroup from /proc/self/cgroup.
-/// Never creates a top-level directory under /sys/fs/cgroup to avoid
-/// interfering with session managers (elogind, systemd-logind) that
-/// own the cgroup hierarchy.
-async fn setup_cgroup_root() -> Result<PathBuf> {
-    let content = tokio::fs::read_to_string("/proc/self/cgroup").await
-        .context("read /proc/self/cgroup")?;
+/// Parse /proc/self/cgroup and return the delegated cgroupv2 path if one
+/// is present and exists on the filesystem.  Returns `None` if no `0::`
+/// line is found or the resolved path does not exist.
+fn read_delegated_cgroup() -> Option<PathBuf> {
+    let content = std::fs::read_to_string("/proc/self/cgroup").ok()?;
 
+    // Strip any tier-suffix left over from a previous daemon run so that
+    // re-use of an already-configured subtree works correctly.
     const TIER_SUFFIXES: &[&str] = &[
         "/rt", "/interactive", "/system", "/background", "/idle", "/swapstorm",
     ];
@@ -204,16 +213,46 @@ async fn setup_cgroup_root() -> Result<PathBuf> {
         if let Some(raw) = line.strip_prefix("0::") {
             let raw = raw.trim();
             let clean = TIER_SUFFIXES.iter()
-                .fold(raw.to_string(), |s, t| s.strip_suffix(t).map(|x| x.to_string()).unwrap_or(s));
+                .fold(raw.to_string(), |s, t| {
+                    s.strip_suffix(t).map(|x| x.to_string()).unwrap_or(s)
+                });
             let full = PathBuf::from(format!("/sys/fs/cgroup{}", clean));
             if full.exists() {
-                tracing::info!("cgroup root (delegated): {}", full.display());
-                return Ok(full);
+                return Some(full);
             }
         }
     }
+    None
+}
 
-    anyhow::bail!("could not determine a writable cgroup root")
+/// Init-system-agnostic cgroup root setup.
+///
+/// **Systemd with `Delegate=yes`**: `/proc/self/cgroup` yields something like
+/// `0::/system.slice/ulatencyd.service`, so `full` =
+/// `/sys/fs/cgroup/system.slice/ulatencyd.service` → we use it directly.
+///
+/// **runit / s6 / OpenRC / manual root**: the daemon starts in the root
+/// cgroup (`0::/`), so `full` = `/sys/fs/cgroup` — the cgroupv2 filesystem
+/// root itself, which is owned by the session manager (elogind/systemd-logind).
+/// Writing our tier hierarchy there would interfere with their delegation.
+/// We fall back to creating `/sys/fs/cgroup/ulatencyd` directly instead.
+async fn setup_cgroup_root() -> Result<PathBuf> {
+    // 1. Try the delegated cgroup from /proc/self/cgroup.
+    if let Some(delegated) = read_delegated_cgroup() {
+        if delegated != PathBuf::from("/sys/fs/cgroup") {
+            info!("cgroup root (delegated): {}", delegated.display());
+            return Ok(delegated);
+        }
+        // Delegated to the cgroupv2 root — fall through to direct creation.
+        tracing::info!(
+            "cgroup delegated to root (/sys/fs/cgroup); \
+             using /sys/fs/cgroup/ulatencyd instead"
+        );
+    }
+
+    // 2. Fallback: create /sys/fs/cgroup/ulatencyd directly.
+    //    Works on runit, s6, OpenRC, and when run manually as root.
+    cgroupv2::setup_direct_root().await
 }
 
 fn write_pid_file(path: &std::path::Path) {

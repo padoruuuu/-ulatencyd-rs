@@ -385,30 +385,7 @@ impl RuleEngine {
 // Default classification by session origin
 // ---------------------------------------------------------------------------
 
-/// Derive a default cgroup tier from process metadata without knowing the
-/// app name. Works on all init systems.
-///
-/// Rules:
-///   uid > 0, UserInteractive/UserApp/Unknown → interactive
-///   uid > 0, UserService                     → system
-///   uid = 0, SystemService                   → system
-///   uid = 0, UserInteractive (su/sudo child) → system
-fn default_cgroup_for(_proc: &procmon::ProcessInfo) -> Option<String> {
-    // Never move any process by default.
-    //
-    // uid >= 1000 (real users): stay in their session scope — moving breaks
-    // session-scoped IPC (audio, settings, browsers, volume controls).
-    // Named rules (50-background.toml etc.) handle the specific processes
-    // that should be moved (package managers, build tools, etc.).
-    //
-    // uid 0-999 (root and system accounts): stay where the init system placed
-    // them. Moving login managers, TTY handlers, session supervisors, or any
-    // other uid=0 process breaks session management on every init system.
-    // Named rules handle the specific system daemons we want to throttle.
-    //
-    // The default classifier's job is to do nothing. Named rules do the work.
-    None
-}
+
 
 // ---------------------------------------------------------------------------
 // Loading and compiling

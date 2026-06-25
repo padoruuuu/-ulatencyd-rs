@@ -30,6 +30,7 @@ use crate::config::Config;
 use crate::diag::{diag, diag_section};
 use crate::focus::ForegroundTracker;
 use crate::forkbomb::ForkBombDetector;
+use crate::init::InitSystem;
 use crate::process_table::ProcessTable;
 use crate::sched::{
     AutogroupGuard, PowerState, apply_sched_profile,
@@ -55,9 +56,10 @@ pub struct Daemon {
 
 impl Daemon {
     pub async fn new(
-        config: Config,
-        cgmgr:  CgroupManager,
-        state:  Arc<Mutex<SharedState>>,
+        config:     Config,
+        cgmgr:      CgroupManager,
+        state:      Arc<Mutex<SharedState>>,
+        init_system: InitSystem,
     ) -> Result<Self> {
         let engine = RuleEngine::load(&config.daemon.rules_dir)?;
         info!("rule engine: {} rules loaded", engine.rule_count());
@@ -65,6 +67,24 @@ impl Daemon {
         let forkbomb = ForkBombDetector::new(
             config.fork_bomb.threshold_per_second,
             config.fork_bomb.lineage_depth,
+        );
+
+        // Startup grace period: during the first N seconds after launch,
+        // no process classification or cgroup moves are applied. This
+        // prevents interfering with session startup on non-systemd init
+        // systems (runit, s6, OpenRC) where the daemon may start before
+        // the graphical session is fully initialised.
+        //
+        // The grace period is tuned per init system — systemd services
+        // typically start after the session is ready, so a shorter window
+        // is safe.
+        let grace_secs = init_system.startup_grace_secs();
+        let startup_deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(grace_secs);
+
+        info!(
+            "startup grace period: {} s (init={:?})",
+            grace_secs, init_system
         );
 
         Ok(Self {
@@ -75,8 +95,8 @@ impl Daemon {
             forkbomb,
             focus: ForegroundTracker::new(),
             state,
-            startup_deadline: tokio::time::Instant::now(),
-            startup_phase:    true,
+            startup_deadline,
+            startup_phase: true,
         })
     }
 
@@ -129,15 +149,11 @@ impl Daemon {
             self.do_full_scan(&dbus_conn).await;
         }
 
-        // Startup grace period: during the first 30 seconds after launch,
-        // no process classification or cgroup moves are applied. This
-        // prevents interfering with session startup on non-systemd init
-        // systems (runit, s6, OpenRC) where the daemon may start before
-        // the graphical session is fully initialised.
-        const STARTUP_GRACE_SECS: u64 = 30;
-        self.startup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(STARTUP_GRACE_SECS);
+        // Startup grace period is already configured in Daemon::new()
+        // based on the detected init system.  We re-assert it here so
+        // that a future restart/reset path can re-enter the grace period
+        // without duplicating the init-system logic.
         self.startup_phase = true;
-        info!("entering startup grace period ({}s)", STARTUP_GRACE_SECS);
 
         info!("event loop started");
 
@@ -152,7 +168,20 @@ impl Daemon {
                 // Netlink proc event.
                 event = proc_monitor.next_event() => {
                     match event {
-                        Some(e) => self.handle_proc_event(e, &dbus_conn).await,
+                        Some(e) => {
+                            if self.startup_phase {
+                                // During the grace period we still drain the
+                                // channel so the 4096-slot buffer never fills
+                                // and stalls the listener thread (which causes
+                                // the kernel to drop events, including future
+                                // Exits).  Process Exits for bookkeeping only;
+                                // full classification happens after the grace
+                                // period via do_full_scan().
+                                self.handle_proc_event_startup(e).await;
+                            } else {
+                                self.handle_proc_event(e, &dbus_conn).await;
+                            }
+                        }
                         None    => {
                             warn!("netlink proc monitor closed — stopping");
                             break;
@@ -231,6 +260,64 @@ impl Daemon {
 
         self.shutdown().await;
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Proc events (startup-phase — bookkeeping only, no classification)
+    // -----------------------------------------------------------------------
+
+    /// Lightweight event handler used during the startup grace period.
+    /// Keeps the netlink channel drained to prevent buffer saturation and
+    /// dropped Exit events.  Only Exit events need real processing — Fork
+    /// events are ignored (the subsequent full scan will pick up survivors)
+    /// and Exec/Comm/Uid events are deferred to post-grace classification.
+    async fn handle_proc_event_startup(&mut self, event: ProcEvent) {
+        match event {
+            ProcEvent::Fork { parent_pid, child_pid, child_tgid } => {
+                diag!("FORK(startup)", "parent={} child={} tgid={}", parent_pid, child_pid, child_tgid);
+                // Still track forks for fork-bomb detection even during startup.
+                if child_pid == child_tgid {
+                    if let Some(ppid) = self.forkbomb.record_fork(parent_pid) {
+                        let count = self.forkbomb
+                            .throttle_subtree(ppid, &self.table, &self.cgmgr)
+                            .await;
+                        debug!("startup fork-bomb: ppid={} throttled {} pids", ppid, count);
+                    }
+                }
+                // Insert into table so children_of() works correctly once
+                // the grace period ends and classify_and_apply() runs.
+                if let Ok(info) = ProcessInfo::from_pid(child_pid) {
+                    self.table.insert(info);
+                    self.table.mark_classified(child_pid); // defer classification
+                }
+            }
+
+            ProcEvent::Exit { pid, .. } => {
+                diag!("EXIT(startup)", "pid={}", pid);
+                self.focus.on_exit(pid);
+                self.table.remove(pid);
+                // Remove from managed even though classification is deferred —
+                // a previous daemon instance or a pre-existing classified entry
+                // could be in the map.
+                self.state.lock().await.managed.remove(&pid);
+            }
+
+            // Exec/Comm/Uid during startup: just insert into the table so we
+            // have current process info, but defer classification.
+            ProcEvent::Exec { pid } => {
+                if let Ok(info) = ProcessInfo::from_pid(pid) {
+                    self.table.insert(info);
+                    // insert() resets classified=false; re-mark as classified
+                    // so the startup-phase guard below doesn't re-attempt.
+                    // After grace period, do_full_scan will reclassify properly.
+                    self.table.mark_classified(pid);
+                }
+            }
+
+            ProcEvent::Comm { .. } | ProcEvent::Uid { .. } => {
+                // Ignore during startup — do_full_scan handles these.
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -386,6 +473,17 @@ impl Daemon {
             return;
         }
 
+        // Do not demote a process that the focus tracker has boosted to interactive.
+        // The foreground tracker owns these PIDs; classify_and_apply must not override
+        // their cgroup/nice placement.  Without this guard, do_rechecks() → table.insert()
+        // resets classified=false on browser PIDs, triggering a full rule-engine
+        // re-evaluation that demotes them from interactive back to system, causing
+        // a visible freeze until the focus tracker re-promotes them.
+        if self.focus.is_foreground(pid) {
+            self.table.mark_classified(pid);
+            return;
+        }
+
         let ancestors = self.table.ancestor_comms(pid, 10);
 
         match self.engine.classify(info, &ancestors) {
@@ -470,12 +568,31 @@ impl Daemon {
             .map(|p| p.pid)
             .collect();
 
+        // Build live-PID set before merge_scan consumes `fresh`.
+        let live_pids: std::collections::HashSet<u32> =
+            fresh.iter().map(|p| p.pid).collect();
+
         self.table.merge_scan(fresh);
         tracing::info!(
             "full scan: {} processes ({} new to classify)",
             count, unclassified.len()
         );
         diag_section(&format!("SCAN {} procs {} new", count, unclassified.len()));
+
+        // Bug 5 fix: GC the D-Bus managed map against the live PID set.
+        // merge_scan() already prunes ProcessTable, but SharedState::managed
+        // is a separate map that only gets cleaned on Exit events.  If an
+        // Exit event was dropped (netlink backpressure, kernel buffer overflow)
+        // the entry would leak forever without this sweep.
+        {
+            let mut state = self.state.lock().await;
+            let before = state.managed.len();
+            state.managed.retain(|pid, _| live_pids.contains(pid));
+            let removed = before - state.managed.len();
+            if removed > 0 {
+                debug!("gc: removed {} stale managed entries", removed);
+            }
+        }
 
         // Suppress D-Bus signals during bulk classification — emitting hundreds
         // of signals at boot floods the bus and slows startup significantly.
@@ -506,13 +623,27 @@ impl Daemon {
     async fn do_rechecks(&mut self, dbus_conn: &Option<zbus::Connection>) {
         let expired = self.table.expired_rechecks();
         for pid in expired {
+            // Do not re-insert or re-classify processes that the focus tracker
+            // has boosted to interactive.  table.insert() resets classified=false,
+            // which would trigger a full rule-engine re-evaluation on the next
+            // classify_and_apply call and demote the foreground process from
+            // interactive to whichever system rule matches — exactly the freeze
+            // bug this guard is meant to prevent.  The foreground guard inside
+            // classify_and_apply() also catches this, but skipping re-insertion
+            // here avoids the unnecessary /proc read entirely.
+            if self.focus.is_foreground(pid) {
+                continue;
+            }
             match ProcessInfo::from_pid(pid) {
                 Ok(proc_info) => {
                     self.table.insert(proc_info.clone());
                     self.classify_and_apply(pid, &proc_info, dbus_conn).await;
                 }
                 Err(_) => {
+                    // Bug 1 fix: remove from both stores so the D-Bus managed
+                    // map doesn't accumulate ghost entries for dead processes.
                     self.table.remove(pid);
+                    self.state.lock().await.managed.remove(&pid);
                 }
             }
         }

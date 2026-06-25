@@ -21,14 +21,11 @@ use tracing::{debug, info, warn};
 /// Inode of /proc/self/ns/cgroup, cached at first call.
 static SELF_CGROUP_NS: OnceLock<u64> = OnceLock::new();
 
-/// Public wrapper for use by the daemon's classify_and_apply.
-pub fn same_cgroup_ns_pub(pid: u32) -> bool {
-    same_cgroup_ns(pid)
-}
+
 
 /// Returns true if `pid` is in the same cgroup namespace as this process.
 /// Processes in a different namespace (bwrap, containers) are skipped.
-fn same_cgroup_ns(pid: u32) -> bool {
+pub fn same_cgroup_ns(pid: u32) -> bool {
     let self_ino = SELF_CGROUP_NS.get_or_init(|| {
         std::fs::metadata("/proc/self/ns/cgroup")
             .map(|m| { use std::os::unix::fs::MetadataExt; m.ino() })
@@ -211,6 +208,8 @@ impl CgroupManager {
     }
 
     /// Garbage-collect empty child cgroups (non-blocking, spawns a task).
+    /// A tier cgroup is only removable when it has no member processes.
+    /// We leave occupied tiers alone — they are rebuilt on the next setup_hierarchy().
     pub fn gc_empty_cgroups(&self) {
         let root = self.root.clone();
         tokio::spawn(async move {
@@ -218,7 +217,13 @@ impl CgroupManager {
                 let cg = Cgroup { path: root.join(tier.dir_name()) };
                 match cg.pids().await {
                     Ok(pids) if pids.is_empty() => {
-                        debug!("cgroup {} is empty", cg.path.display());
+                        // Bug 4 fix: actually remove the empty directory instead
+                        // of only logging it.  remove_dir() is a no-op if the
+                        // cgroup doesn't exist or isn't empty.
+                        match fs::remove_dir(&cg.path).await {
+                            Ok(_)  => debug!("gc: removed empty cgroup {}", cg.path.display()),
+                            Err(e) => debug!("gc: could not remove {}: {}", cg.path.display(), e),
+                        }
                     }
                     _ => {}
                 }
@@ -228,14 +233,12 @@ impl CgroupManager {
 
     /// Shutdown cleanup.
     ///
-    /// We do NOT move managed processes — with KillMode=process in the systemd
-    /// unit, managed processes are not killed when the daemon stops, so there
-    /// is nothing to rescue. Moving hundreds of pids one by one via cgroup.procs
-    /// writes is the cause of the blank-TTY hang during shutdown.
+    /// Managed processes are not killed when the daemon stops; they continue
+    /// running in whichever tier they were last placed.  We only try to remove
+    /// now-empty tier directories.
     ///
-    /// We just attempt to remove the (hopefully now-empty) tier directories.
-    /// Each rmdir is capped at 100ms; occupied cgroups are silently left in
-    /// place and the kernel cleans them up when the last process exits.
+    /// Each rmdir is capped at 100 ms; occupied cgroups are silently left in
+    /// place — the kernel removes them automatically once the last process exits.
     pub async fn teardown(&self) {
         for tier in all_tiers() {
             let path = self.root.join(tier.dir_name());
@@ -283,6 +286,40 @@ impl CgroupManager {
     }
 
     async fn create_and_configure_tiers(&self) -> Result<()> {
+        // TODO(cgroupv2-future): Upcoming kernel interfaces worth adopting:
+        //
+        // 1. cpu.idle (kernel 6.4+, stable): Writing `1` makes an entire cgroup
+        //    run at SCHED_IDLE priority — strictly below all non-idle CFS work.
+        //    The `idle` and `swapstorm` tiers currently use cpu.weight=100/50.
+        //    Switching them to cpu.idle=1 is more semantically correct and more
+        //    aggressive about deprioritisation.  Gated on kernel version detection.
+        //
+        // 2. memory.reclaim (kernel 6.4+, stable): A write-only file that triggers
+        //    synchronous memory reclaim on a cgroup.  In handle_pressure_change(High),
+        //    instead of/before moving processes to `swapstorm`, proactively writing to
+        //    idle/memory.reclaim and background/memory.reclaim could free memory without
+        //    a disruptive cgroup move.
+        //
+        // 3. cgroup.pressure (modern kernels): A per-cgroup PSI roll-up.  Can be read
+        //    to see which of our own tiers is under pressure — more granular than
+        //    /proc/pressure/memory which is system-wide.
+        //
+        // 4. PSI threshold notifications via poll() (kernel 5.2+): /proc/pressure/memory
+        //    accepts writes of the form `some 500 1000000` to register a threshold
+        //    trigger; the fd becomes readable when the threshold is crossed.  This would
+        //    let psi/src/lib.rs switch from 500 ms polling to event-driven wakeups —
+        //    better latency, zero CPU when idle.
+        //
+        // 5. sched_ext cgroup weight callbacks (kernel 6.12+, maturing in 6.14/6.15):
+        //    When a BPF scheduler implements `cgroup_set_weight`, our cpu.weight writes
+        //    *do* have effect under sched_ext.  Detection should be refined: check
+        //    whether the active scheduler has the callback rather than skipping all
+        //    weight writes unconditionally via sched_ext_active.
+        //
+        // 6. memory.zswap.max / memory.zswap.writeback (kernel 6.x, stable): For the
+        //    `swapstorm` tier, in addition to memory.swap.max=0, consider setting
+        //    memory.zswap.max=0 to also block zswap usage, or conversely allow
+        //    zswap-only (no disk swap) as a softer limit.
         for tier in all_tiers() {
             let dir = self.root.join(tier.dir_name());
             if !dir.exists() {

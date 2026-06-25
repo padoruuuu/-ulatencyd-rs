@@ -1,6 +1,5 @@
 //! Full /proc directory scan — used on startup and periodic GC sweeps.
 
-use std::path::Path;
 use tracing::{debug, warn};
 
 use crate::info::ProcessInfo;

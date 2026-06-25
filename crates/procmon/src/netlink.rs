@@ -234,6 +234,9 @@ fn subscribe_to_proc_events(fd: RawFd) -> Result<()> {
     };
 
     if rc < 0 {
+        // Bug 3 fix: close the socket before returning so the fd is never
+        // leaked when the caller (ProcMonitor::spawn) gets this error.
+        unsafe { libc::close(fd); }
         bail!("sendto(PROC_CN_MCAST_LISTEN) failed: errno {}", errno());
     }
     Ok(())

@@ -171,8 +171,9 @@ async fn cmd_pressure(proxy: &zbus::Proxy<'_>) -> Result<()> {
 
     println!("PSI pressure metrics (10-second avg):");
     println!("  memory.some:  {:.2}%", metrics.get("memory_some_avg10").copied().unwrap_or(0.0));
-    println!("  memory.full:  n/a (use GetSystemPressure for full)");
+    println!("  memory.full:  {:.2}%", metrics.get("memory_full_avg10").copied().unwrap_or(0.0));
     println!("  io.some:      {:.2}%", metrics.get("io_some_avg10").copied().unwrap_or(0.0));
+    println!("  io.full:      {:.2}%", metrics.get("io_full_avg10").copied().unwrap_or(0.0));
     println!("  cpu.some:     {:.2}%", metrics.get("cpu_some_avg10").copied().unwrap_or(0.0));
     Ok(())
 }
