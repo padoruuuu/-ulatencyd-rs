@@ -205,4 +205,4 @@ ulatencyctl watch-signals       # stream D-Bus signals to stdout
 
 ## License
 
-MIT OR Apache-2.0
+GPLv3
