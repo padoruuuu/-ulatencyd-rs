@@ -1,9 +1,6 @@
 [Unit]
 Description=ulatencyd-rs — cgroup v2 + scheduler latency daemon
 Documentation=https://github.com/padoruuuu/-ulatencyd-rs
-# Run after D-Bus is available (needed for UPower and our own D-Bus service).
-After=dbus.service
-Wants=dbus.service
 # Do NOT use Before=display-manager.service — we should not block graphical
 # boot. The daemon classifies existing processes on startup so it catches
 # everything even when starting concurrently with the session.
@@ -45,7 +42,12 @@ ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=yes
 RuntimeDirectory=ulatencyd
-RuntimeDirectoryMode=0755
+# 0750: only root and the control_socket.group members (see ulatencyd.toml)
+# can reach into /run/ulatencyd to find control.sock. ulatencyd itself
+# re-chowns/chmods the directory and socket at startup (crates/core/src/
+# control.rs) — this is just a sane starting permission for the window
+# before that happens.
+RuntimeDirectoryMode=0750
 ReadWritePaths=/proc /sys/fs/cgroup
 
 [Install]

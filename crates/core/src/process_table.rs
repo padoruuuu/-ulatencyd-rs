@@ -145,8 +145,14 @@ impl ProcessTable {
             .collect()
     }
 
-    pub fn merge_scan(&mut self, fresh: Vec<ProcessInfo>) {
-        let live: HashSet<u32> = fresh.iter().map(|p| p.pid).collect();
+    /// Merge the results of an incremental scan.
+    ///
+    /// `fresh` contains only *new* processes discovered this scan (see
+    /// `procmon::scan_proc_incremental`) — NOT the full /proc listing, so
+    /// staleness can no longer be derived from `fresh` alone. `live_pids` is
+    /// the authoritative set of every PID that exists in /proc right now;
+    /// anything in the table but not in `live_pids` has exited.
+    pub fn merge_scan(&mut self, fresh: Vec<ProcessInfo>, live_pids: &HashSet<u32>) {
         for info in fresh {
             // Only insert if not already known — preserves classified flag
             // and original_cgroup for existing entries.
@@ -164,12 +170,29 @@ impl ProcessTable {
             }
         }
         let stale: Vec<u32> = self.entries.keys()
-            .filter(|pid| !live.contains(pid))
+            .filter(|pid| !live_pids.contains(pid))
             .copied()
             .collect();
         let count = stale.len();
         for pid in stale { self.remove(pid); }
         if count > 0 { debug!("gc: removed {} stale pids", count); }
+    }
+
+    /// Every PID currently tracked by the table — passed to
+    /// `procmon::scan_proc_incremental` so it can skip the (relatively
+    /// expensive) /proc/pid/* reads for processes we already know about.
+    pub fn known_pids(&self) -> HashSet<u32> {
+        self.entries.keys().copied().collect()
+    }
+
+    /// PIDs with `classified == false` — new this scan, or reset by e.g.
+    /// swapstorm-recovery reclassification.
+    pub fn unclassified_pids(&self) -> Vec<u32> {
+        self.entries
+            .iter()
+            .filter(|(_, e)| !e.classified)
+            .map(|(&pid, _)| pid)
+            .collect()
     }
 
     /// All (pid, original_cgroup) pairs where we have moved the process.

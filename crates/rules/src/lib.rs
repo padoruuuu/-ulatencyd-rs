@@ -24,6 +24,7 @@ use procmon::ProcessInfo;
 
 /// A complete rule file (array of [[rule]] entries plus optional [[profile]]).
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct RuleFile {
     #[serde(default)]
     rule: Vec<RuleToml>,
@@ -33,6 +34,7 @@ struct RuleFile {
 
 /// Raw TOML representation of a [[rule]].
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RuleToml {
     name:     String,
     #[serde(default = "default_priority")]
@@ -48,6 +50,7 @@ fn default_priority() -> i32 { 50 }
 
 /// All optional match predicates (AND-combined).
 #[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct MatchToml {
     #[serde(default)] pub comm:                Vec<String>,
     #[serde(default)] pub comm_prefix:         Vec<String>,
@@ -68,7 +71,16 @@ pub struct MatchToml {
 }
 
 /// Action applied when a rule matches.
+///
+/// `deny_unknown_fields` here catches typo'd action keys in rule/profile
+/// TOML files at load time instead of silently ignoring them. This also
+/// covers [[profile]] blocks: `ProfileToml` can't carry the attribute
+/// itself (serde disallows combining `deny_unknown_fields` with
+/// `#[serde(flatten)]`), but since its `action` field flattens into this
+/// struct, an unrecognized key in a `[[profile]]` block still fails to
+/// deserialize here.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ActionToml {
     pub cgroup:              Option<String>,
     pub nice:                Option<i8>,
@@ -78,7 +90,6 @@ pub struct ActionToml {
     pub io_weight:           Option<u32>,
     pub recheck_secs:        Option<u64>,
     pub apply_to_children:   Option<bool>,
-    pub script:              Option<String>,
 }
 
 /// A [[profile]] block (used for inheritance).
@@ -286,16 +297,30 @@ impl ExceptionList {
 pub struct RuleEngine {
     rules: Vec<Rule>,
     exceptions: ExceptionList,
+    /// True if any loaded rule declares `match.env_set`. Cached at
+    /// load()/reload() time so `classify_and_apply` can cheaply decide
+    /// whether it's worth paying for a `/proc/pid/environ` read (which can
+    /// be several KB) before classifying a process — see
+    /// `Matchers::matches`'s `env_set` check.
+    wants_environ: bool,
 }
 
 impl RuleEngine {
     /// Load rules from a list of directories. Later directories take precedence.
     pub fn load(dirs: &[PathBuf]) -> Result<Self> {
         let rules = load_rules(dirs)?;
+        let wants_environ = rules.iter().any(|r| !r.matchers.env_set.is_empty());
         Ok(Self {
             rules,
             exceptions: ExceptionList::default(),
+            wants_environ,
         })
+    }
+
+    /// Whether any loaded rule needs `/proc/pid/environ` to evaluate its
+    /// `env_set` match predicate.
+    pub fn wants_environ(&self) -> bool {
+        self.wants_environ
     }
 
     /// Classify a process. Returns an action to apply, or None if the
@@ -372,6 +397,7 @@ impl RuleEngine {
     /// Hot-reload rules from disk.
     pub fn reload(&mut self, dirs: &[PathBuf]) -> Result<()> {
         self.rules = load_rules(dirs)?;
+        self.wants_environ = self.rules.iter().any(|r| !r.matchers.env_set.is_empty());
         info!("rules reloaded: {} rules", self.rules.len());
         Ok(())
     }
@@ -413,7 +439,8 @@ fn load_rules(dirs: &[PathBuf]) -> Result<Vec<Rule>> {
 
             // Register profiles first (build inheritance map).
             for prof in rf.profile {
-                let resolved = resolve_profile_action(&prof, &profile_map);
+                let resolved = resolve_profile_action(&prof, &profile_map)
+                    .with_context(|| format!("profile {:?} in {}", prof.name, path.display()))?;
                 profile_map.insert(prof.name.clone(), resolved);
             }
 
@@ -430,23 +457,29 @@ fn load_rules(dirs: &[PathBuf]) -> Result<Vec<Rule>> {
     Ok(all_rules)
 }
 
-fn resolve_profile_action(prof: &ProfileToml, map: &HashMap<String, ActionToml>) -> ActionToml {
+fn resolve_profile_action(prof: &ProfileToml, map: &HashMap<String, ActionToml>) -> Result<ActionToml> {
     if let Some(ref parent) = prof.inherits {
-        if let Some(base) = map.get(parent) {
-            let mut merged = base.clone();
-            // Override parent with prof's non-None fields.
-            if prof.action.cgroup.is_some()          { merged.cgroup          = prof.action.cgroup.clone(); }
-            if prof.action.nice.is_some()             { merged.nice             = prof.action.nice; }
-            if prof.action.sched_policy.is_some()     { merged.sched_policy     = prof.action.sched_policy.clone(); }
-            if prof.action.sched_priority.is_some()   { merged.sched_priority   = prof.action.sched_priority; }
-            if prof.action.oom_score_adj.is_some()    { merged.oom_score_adj    = prof.action.oom_score_adj; }
-            if prof.action.io_weight.is_some()        { merged.io_weight        = prof.action.io_weight; }
-            if prof.action.recheck_secs.is_some()     { merged.recheck_secs     = prof.action.recheck_secs; }
-            if prof.action.apply_to_children.is_some(){ merged.apply_to_children = prof.action.apply_to_children; }
-            return merged;
-        }
+        let Some(base) = map.get(parent) else {
+            anyhow::bail!(
+                "inherits = {:?} does not match any earlier [[profile]] name \
+                 (profiles can only inherit from profiles already defined earlier \
+                 in the same file, or in a previously-loaded file)",
+                parent
+            );
+        };
+        let mut merged = base.clone();
+        // Override parent with prof's non-None fields.
+        if prof.action.cgroup.is_some()          { merged.cgroup          = prof.action.cgroup.clone(); }
+        if prof.action.nice.is_some()             { merged.nice             = prof.action.nice; }
+        if prof.action.sched_policy.is_some()     { merged.sched_policy     = prof.action.sched_policy.clone(); }
+        if prof.action.sched_priority.is_some()   { merged.sched_priority   = prof.action.sched_priority; }
+        if prof.action.oom_score_adj.is_some()    { merged.oom_score_adj    = prof.action.oom_score_adj; }
+        if prof.action.io_weight.is_some()        { merged.io_weight        = prof.action.io_weight; }
+        if prof.action.recheck_secs.is_some()     { merged.recheck_secs     = prof.action.recheck_secs; }
+        if prof.action.apply_to_children.is_some(){ merged.apply_to_children = prof.action.apply_to_children; }
+        return Ok(merged);
     }
-    prof.action.clone()
+    Ok(prof.action.clone())
 }
 
 fn compile_rule(r: RuleToml, _profiles: &HashMap<String, ActionToml>) -> Result<Rule> {
@@ -525,8 +558,7 @@ mod tests {
             pid: 1234, ppid: 1, uid: 1000, gid: 1000,
             comm: comm.to_string(),
             cmdline: vec![comm.to_string()],
-            exe: None, oom_score: 0, threads: 1, vm_rss_kb: 0,
-            io_read_bytes: 0, io_write_bytes: 0,
+            exe: None, threads: 1, vm_rss_kb: 0,
             sched_policy: procmon::SchedPolicy::Normal,
             nice: 0, cgroup_path: None,
             session_origin: procmon::SessionOrigin::Unknown,

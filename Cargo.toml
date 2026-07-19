@@ -4,24 +4,31 @@ members = [
 "crates/procmon",
 "crates/cgroupv2",
 "crates/rules",
-"crates/dbus-api",
 "crates/psi",
 "crates/cli",
 ]
 resolver = "2"
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["full"] }
+# Only the tokio features actually used anywhere in the main workspace —
+# confirmed by grepping tokio:: call sites. No "net" (nothing calls
+# tokio::net directly; procmon's netlink socket is a raw libc socket on its
+# own std::thread). No "rt-multi-thread" (the daemon runs
+# #[tokio::main(flavor = "current_thread")]).
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt", "signal", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_derive = "1"
 anyhow = "1"
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-zbus = { version = "=4.1.2", default-features = false, features = ["tokio"] }
 toml = "0.7"
 nix = { version = "0.27", features = ["signal", "process", "fs", "sched", "resource"] }
 libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 wildmatch = "2"
 itoa = "1"
+async-trait = "0.1"
+varlink = "13"
+varlink_generator = "13"

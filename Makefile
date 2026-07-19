@@ -2,11 +2,10 @@ PREFIX     ?= /usr
 DESTDIR    ?=
 BINDIR      = $(DESTDIR)$(PREFIX)/sbin
 USRBIN      = $(DESTDIR)$(PREFIX)/bin
+LIBEXEC     = $(DESTDIR)$(PREFIX)/libexec
 RULESDIR    = $(DESTDIR)$(PREFIX)/lib/ulatencyd/rules
 CONFDIR     = $(DESTDIR)/etc/ulatencyd
 DBUSDIR     = $(DESTDIR)/etc/dbus-1/system.d
-POLKITACTS  = $(DESTDIR)$(PREFIX)/share/polkit-1/actions
-POLKITRULES = $(DESTDIR)$(PREFIX)/share/polkit-1/rules.d
 SYSTEMDDIR  = $(DESTDIR)/lib/systemd/system
 
 RUNIT_SVDIR  ?= /etc/runit/sv
@@ -15,14 +14,55 @@ RUNIT_RUNDIR ?= /run/runit/service
 CARGO_FLAGS ?= --release
 SRCDIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
-.PHONY: build install install-rules install-config install-dbus install-polkit uninstall clean pkg
+.PHONY: build build-shim install install-group enable-user install-rules \
+        install-config install-services install-shim uninstall uninstall-shim \
+        clean pkg
 
 build:
 	cd $(SRCDIR) && cargo build $(CARGO_FLAGS)
 
-# Universal install — all init-system service files are installed
-# unconditionally.  Switching init systems later requires no reinstall.
-install: install-rules install-config install-dbus install-polkit install-services
+# Creates the system group referenced by ulatencyd.toml's [control_socket]
+# section (default: ulatencyd) and adds whoever ran `sudo make install` to
+# it. Skipped entirely when DESTDIR is set — that means we're being
+# packaged into a fakeroot (e.g. makepkg), where mutating the real system's
+# group database would be wrong; see the `pkg` target's post_install()
+# instead for that path.
+install-group:
+ifeq ($(DESTDIR),)
+	@getent group ulatencyd >/dev/null 2>&1 || { \
+	    groupadd --system ulatencyd && echo "created system group: ulatencyd"; \
+	}
+	@if [ -n "$$SUDO_USER" ]; then \
+	    if id -nG "$$SUDO_USER" 2>/dev/null | tr ' ' '\n' | grep -qx ulatencyd; then \
+	        echo "$$SUDO_USER is already in the ulatencyd group"; \
+	    else \
+	        usermod -aG ulatencyd "$$SUDO_USER" && \
+	        echo ">>> added $$SUDO_USER to the ulatencyd group."; \
+	        echo ">>> log out and back in (or run: newgrp ulatencyd) before using ulatencyctl —"; \
+	        echo ">>> group membership doesn't apply to an already-running shell session."; \
+	    fi; \
+	else \
+	    echo "SUDO_USER not set (did you run this as plain root, not via sudo?)."; \
+	    echo "Add whichever user(s) should run ulatencyctl yourself:"; \
+	    echo "  sudo usermod -aG ulatencyd <username>"; \
+	fi
+else
+	@echo "DESTDIR is set — skipping group/user setup (packaging build)."
+	@echo "See the 'pkg' target's post_install() for the packaged equivalent."
+endif
+
+# Add another user to the control-socket group after the fact, e.g.:
+#   sudo make enable-user USER_TO_ADD=alice
+enable-user:
+	@test -n "$(USER_TO_ADD)" || { echo "usage: sudo make enable-user USER_TO_ADD=<username>"; exit 1; }
+	usermod -aG ulatencyd "$(USER_TO_ADD)"
+	@echo ">>> added $(USER_TO_ADD) to the ulatencyd group."
+	@echo ">>> they need to log out and back in (or run: newgrp ulatencyd) for it to apply."
+
+# The daemon and CLI need no D-Bus or polkit at all — control happens over a
+# local varlink Unix socket, gated by Unix group membership (see
+# install-group above).
+install: install-group install-rules install-config install-services
 	install -Dm755 $(SRCDIR)target/release/ulatencyd   $(BINDIR)/ulatencyd
 	install -Dm755 $(SRCDIR)target/release/ulatencyctl $(USRBIN)/ulatencyctl
 	@echo ""
@@ -38,6 +78,8 @@ install: install-rules install-config install-dbus install-polkit install-servic
 	  openrc-init) echo "  OpenRC   : rc-update add ulatencyd default" ;; \
 	  *)           echo "  Unknown init ($$INIT) — enable manually from $(SRCDIR)contrib/" ;; \
 	esac
+	@echo ""
+	@echo "  Need com.system76.Scheduler D-Bus compat? See contrib/system76-compat-shim/"
 	@echo ""
 
 # Install service definitions for ALL init systems so a future init
@@ -64,45 +106,54 @@ install-config:
 	install -dm755 $(CONFDIR)/rules
 	test -f $(CONFDIR)/ulatencyd.toml || install -m644 $(SRCDIR)ulatencyd.toml $(CONFDIR)/ulatencyd.toml
 
-install-dbus:
-	install -Dm644 $(SRCDIR)contrib/dbus/org.ulatencyd.Ulatencyd1.conf \
-	    $(DBUSDIR)/org.ulatencyd.Ulatencyd1.conf
-	@# Reload dbus-daemon so it picks up the new policy without a reboot.
+# Optional: com.system76.Scheduler D-Bus compatibility shim. This is a
+# separate, standalone crate (its own Cargo.toml with an empty [workspace])
+# and is NOT built by 'make build' or installed by 'make install'. See
+# contrib/system76-compat-shim/README.md.
+build-shim:
+	cd $(SRCDIR)contrib/system76-compat-shim && cargo build --release
+
+install-shim:
+	install -Dm755 $(SRCDIR)contrib/system76-compat-shim/target/release/ulatencyd-system76-shim \
+	    $(LIBEXEC)/ulatencyd-system76-shim
+	install -Dm644 $(SRCDIR)contrib/system76-compat-shim/ulatencyd-system76-shim.service \
+	    $(SYSTEMDDIR)/ulatencyd-system76-shim.service
+	install -Dm644 $(SRCDIR)contrib/system76-compat-shim/com.system76.Scheduler.conf \
+	    $(DBUSDIR)/com.system76.Scheduler.conf
 	@if pidof dbus-daemon >/dev/null 2>&1; then \
 	    kill -HUP $$(pidof dbus-daemon) && echo "reloaded dbus-daemon"; \
 	elif pidof dbus-broker >/dev/null 2>&1; then \
-	    echo "dbus-broker: reload via your init system if ulatencyctl fails"; \
+	    echo "dbus-broker: reload via your init system if the shim fails to acquire its name"; \
 	fi
-
-install-polkit:
-	install -Dm644 $(SRCDIR)contrib/polkit/rs.ulatencyd.policy \
-	    $(POLKITACTS)/rs.ulatencyd.policy
-	install -Dm644 $(SRCDIR)contrib/polkit/rs.ulatencyd.rules \
-	    $(POLKITRULES)/rs.ulatencyd.rules
 
 uninstall:
 	rm -f  $(BINDIR)/ulatencyd
 	rm -f  $(USRBIN)/ulatencyctl
 	rm -rf $(RULESDIR)
-	rm -f  $(DBUSDIR)/org.ulatencyd.Ulatencyd1.conf
-	rm -f  $(POLKITACTS)/rs.ulatencyd.policy
-	rm -f  $(POLKITRULES)/rs.ulatencyd.rules
 	rm -f  $(SYSTEMDDIR)/ulatencyd.service
 	rm -f  $(RUNIT_RUNDIR)/ulatencyd
 	rm -rf $(RUNIT_SVDIR)/ulatencyd
 
+uninstall-shim:
+	rm -f  $(LIBEXEC)/ulatencyd-system76-shim
+	rm -f  $(SYSTEMDDIR)/ulatencyd-system76-shim.service
+	rm -f  $(DBUSDIR)/com.system76.Scheduler.conf
+
 clean:
 	cd $(SRCDIR) && cargo clean
 
-# Build and install via makepkg (Arch Linux)
+# Build and install via makepkg (Arch Linux) — core package only, no D-Bus
+# or polkit dependency. Package contrib/system76-compat-shim separately if
+# you need it.
 pkg:
 	@echo "pkgname=ulatencyd-rs" > PKGBUILD.tmp
 	@echo "pkgver=0.1.0" >> PKGBUILD.tmp
 	@echo "pkgrel=1" >> PKGBUILD.tmp
 	@echo "arch=('x86_64')" >> PKGBUILD.tmp
 	@echo "license=('GPL')" >> PKGBUILD.tmp
-	@echo "depends=('cargo' 'systemd' 'dbus' 'polkit')" >> PKGBUILD.tmp
-	@echo "makedepends=('rust')" >> PKGBUILD.tmp
+	@echo "depends=('systemd')" >> PKGBUILD.tmp
+	@echo "makedepends=('rust' 'cargo')" >> PKGBUILD.tmp
+	@echo "install=ulatencyd-rs.install" >> PKGBUILD.tmp
 	@echo "source=('local')" >> PKGBUILD.tmp
 	@echo "build() {" >> PKGBUILD.tmp
 	@echo "  cd \"\$$srcdir\"" >> PKGBUILD.tmp
@@ -113,10 +164,16 @@ pkg:
 	@echo "  install -Dm755 target/release/ulatencyctl \"\$$pkgdir/usr/bin/ulatencyctl\"" >> PKGBUILD.tmp
 	@echo "  install -Dm644 rules/*.toml -t \"\$$pkgdir/usr/lib/ulatencyd/rules\"" >> PKGBUILD.tmp
 	@echo "  install -Dm644 ulatencyd.toml \"\$$pkgdir/etc/ulatencyd/ulatencyd.toml\"" >> PKGBUILD.tmp
-	@echo "  install -Dm644 contrib/dbus/org.ulatencyd.Ulatencyd1.conf \"\$$pkgdir/etc/dbus-1/system.d/org.ulatencyd.Ulatencyd1.conf\"" >> PKGBUILD.tmp
-	@echo "  install -Dm644 contrib/polkit/rs.ulatencyd.policy \"\$$pkgdir/usr/share/polkit-1/actions/rs.ulatencyd.policy\"" >> PKGBUILD.tmp
-	@echo "  install -Dm644 contrib/polkit/rs.ulatencyd.rules \"\$$pkgdir/usr/share/polkit-1/rules.d/rs.ulatencyd.rules\"" >> PKGBUILD.tmp
 	@echo "  install -Dm644 contrib/systemd/ulatencyd.service \"\$$pkgdir/lib/systemd/system/ulatencyd.service\"" >> PKGBUILD.tmp
 	@echo "}" >> PKGBUILD.tmp
+	@echo "post_install() {" > ulatencyd-rs.install
+	@echo "  getent group ulatencyd >/dev/null || groupadd --system ulatencyd" >> ulatencyd-rs.install
+	@echo "  echo '==> ulatencyd-rs: add yourself to the ulatencyd group to use ulatencyctl:'" >> ulatencyd-rs.install
+	@echo "  echo '    sudo usermod -aG ulatencyd <username>'" >> ulatencyd-rs.install
+	@echo "  echo '    then log out and back in (or: newgrp ulatencyd)'" >> ulatencyd-rs.install
+	@echo "}" >> ulatencyd-rs.install
+	@echo "post_upgrade() {" >> ulatencyd-rs.install
+	@echo "  post_install" >> ulatencyd-rs.install
+	@echo "}" >> ulatencyd-rs.install
 	makepkg -si -p PKGBUILD.tmp
-	rm -f PKGBUILD.tmp
+	rm -f PKGBUILD.tmp ulatencyd-rs.install

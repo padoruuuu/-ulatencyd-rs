@@ -5,6 +5,7 @@
 
 mod applier;
 mod config;
+mod control;
 mod daemon;
 mod diag;
 mod focus;
@@ -24,10 +25,10 @@ use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use cgroupv2::CgroupManager;
-use dbus_api::{SharedState, start_dbus_service};
 use procmon::ProcMonitor;
 
 use config::Config;
+use control::{ControlCommand, SharedState, start_control_service};
 use daemon::Daemon;
 use diag::flush_diagnostic_log;
 use init::{Supervisor, SupervisorNotify};
@@ -63,7 +64,11 @@ struct Args {
 // main
 // ---------------------------------------------------------------------------
 
-#[tokio::main]
+// Nothing in the daemon needs true CPU parallelism — the event loop is a
+// single tokio::select! over I/O-bound sources, and cgroup/sysctl writes are
+// either quick or explicitly spawn_blocking'd.  A single-threaded runtime
+// avoids the overhead of the multi-thread scheduler and work-stealing queues.
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -107,8 +112,8 @@ async fn main() -> Result<()> {
     // Announce our PID so the supervisor can track us (systemd MAINPID=).
     notify.mainpid(std::process::id());
 
-    // Extend the startup timeout — cgroup setup and D-Bus initialisation
-    // can take a few seconds on busy systems.
+    // Extend the startup timeout — cgroup setup and control socket
+    // initialisation can take a few seconds on busy systems.
     notify.extend_timeout(15_000_000); // 15 s
 
     // Set up cgroup hierarchy — init-system agnostic.
@@ -129,32 +134,26 @@ async fn main() -> Result<()> {
 
     info!("cgroup hierarchy ready at {}", cgmgr.root.display());
 
-    // Shared state (D-Bus + main loop).
+    // Shared state (control socket + main loop).
     let state = Arc::new(Mutex::new(SharedState::new()));
 
-    // D-Bus service.
-    let (dbus_conn, dbus_rx) = if config.dbus.enabled {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            start_dbus_service(Arc::clone(&state)),
-        )
-        .await
-        {
-            Ok(Ok((conn, rx))) => (Some(conn), rx),
-            Ok(Err(e)) => {
-                tracing::warn!("D-Bus service failed to start: {} (continuing without)", e);
+    // Control socket service.
+    let (control_rx, control_tx) = if config.control_socket.enabled {
+        match start_control_service(
+            Arc::clone(&state),
+            &config.control_socket.path,
+            &config.control_socket.group,
+        ).await {
+            Ok((rx, tx)) => (rx, Some(tx)),
+            Err(e) => {
+                tracing::warn!("control socket failed to start: {} (continuing without)", e);
                 let (_, rx) = tokio::sync::mpsc::channel(1);
-                (None, rx)
-            }
-            Err(_) => {
-                tracing::warn!("D-Bus service start timed out (continuing without)");
-                let (_, rx) = tokio::sync::mpsc::channel(1);
-                (None, rx)
+                (rx, None)
             }
         }
     } else {
         let (_, rx) = tokio::sync::mpsc::channel(1);
-        (None, rx)
+        (rx, None)
     };
 
     // Netlink proc monitor.
@@ -164,12 +163,22 @@ async fn main() -> Result<()> {
     // Signals.
     let (shutdown, mut sighup_rx) = init_signals();
 
-    // Wire SIGHUP → rule reload (the daemon's dbus_rx also accepts ReloadRules).
-    tokio::spawn(async move {
-        while sighup_rx.recv().await.is_some() {
-            tracing::info!("SIGHUP received: send 'ulatencyctl reload' or wait for next rule check");
-        }
-    });
+    // Wire SIGHUP → rule reload directly onto the control channel, in-process,
+    // no socket round trip needed.
+    if let Some(tx) = control_tx {
+        tokio::spawn(async move {
+            while sighup_rx.recv().await.is_some() {
+                tracing::info!("SIGHUP received: reloading rules");
+                let _ = tx.send(ControlCommand::ReloadRules).await;
+            }
+        });
+    } else {
+        tokio::spawn(async move {
+            while sighup_rx.recv().await.is_some() {
+                tracing::warn!("SIGHUP received but control channel is unavailable; cannot reload");
+            }
+        });
+    }
 
     // Write PID file.
     write_pid_file(&config.daemon.pid_file);
@@ -185,7 +194,7 @@ async fn main() -> Result<()> {
     notify.ready();
     notify.status("running");
 
-    daemon.run(proc_monitor, dbus_rx, dbus_conn, shutdown).await?;
+    daemon.run(proc_monitor, control_rx, shutdown).await?;
 
     notify.stopping();
     flush_diagnostic_log().await;

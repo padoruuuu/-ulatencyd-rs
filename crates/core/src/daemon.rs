@@ -7,7 +7,7 @@
 //!   - cgroup/sched/nice application
 //!   - PSI pressure monitor
 //!   - fork-bomb detector
-//!   - D-Bus command receiver
+//!   - control socket command receiver
 //!   - power-aware sched profile switching
 //!   - SIGHUP (reload) / SIGTERM (graceful shutdown)
 
@@ -20,13 +20,13 @@ use tokio::time;
 use tracing::{debug, info, warn};
 
 use cgroupv2::{CgroupManager, CgroupTier};
-use dbus_api::{DbusCommand, ProcessEntry, SharedState, emit_fork_bomb, emit_pressure_changed, emit_process_classified};
-use procmon::{ProcEvent, ProcessInfo, ProcMonitor, scan_proc};
+use procmon::{ProcEvent, ProcessInfo, ProcMonitor};
 use psi::{PressureLevel, spawn_psi_monitor};
 use rules::RuleEngine;
 
 use crate::applier::{apply_action, apply_cgroup_only};
 use crate::config::Config;
+use crate::control::{ControlCommand, ProcessEntry, SharedState};
 use crate::diag::{diag, diag_section};
 use crate::focus::ForegroundTracker;
 use crate::forkbomb::ForkBombDetector;
@@ -135,9 +135,8 @@ impl Daemon {
     pub async fn run(
         mut self,
         mut proc_monitor: ProcMonitor,
-        mut dbus_rx:      tokio::sync::mpsc::Receiver<DbusCommand>,
-        dbus_conn:        Option<zbus::Connection>,
-        mut shutdown:         ShutdownToken,
+        mut control_rx:   tokio::sync::mpsc::Receiver<ControlCommand>,
+        mut shutdown:     ShutdownToken,
     ) -> Result<()> {
         // Disable autogroup (single highest-impact kernel toggle).
         let _autogroup_guard = if !self.config.sched.autogroup_enabled {
@@ -175,7 +174,7 @@ impl Daemon {
 
         // Initial scan.
         if self.config.daemon.apply_to_existing_processes {
-            self.do_full_scan(&dbus_conn).await;
+            self.do_full_scan().await;
         }
 
         // Startup grace period is already configured in Daemon::new()
@@ -191,7 +190,7 @@ impl Daemon {
             if self.startup_phase && tokio::time::Instant::now() >= self.startup_deadline {
                 info!("startup grace period ended; enabling full classification");
                 self.startup_phase = false;
-                self.do_full_scan(&dbus_conn).await;
+                self.do_full_scan().await;
             }
             tokio::select! {
                 // Netlink proc event.
@@ -208,7 +207,7 @@ impl Daemon {
                                 // period via do_full_scan().
                                 self.handle_proc_event_startup(e).await;
                             } else {
-                                self.handle_proc_event(e, &dbus_conn).await;
+                                self.handle_proc_event(e).await;
                             }
                         }
                         None    => {
@@ -218,10 +217,10 @@ impl Daemon {
                     }
                 }
 
-                // D-Bus command.
-                cmd = dbus_rx.recv() => {
+                // Control socket command.
+                cmd = control_rx.recv() => {
                     match cmd {
-                        Some(c) => self.handle_dbus_cmd(c, &dbus_conn).await,
+                        Some(c) => self.handle_control_cmd(c).await,
                         None    => {}
                     }
                 }
@@ -243,9 +242,6 @@ impl Daemon {
                             pressure.io.some_avg10, pressure.cpu.some_avg10
                         );
                         last_pressure_level = level;
-                        if let Some(ref conn) = dbus_conn {
-                            emit_pressure_changed(conn, level as u32).await;
-                        }
                         self.handle_pressure_change(level).await;
                     }
                 }
@@ -274,12 +270,12 @@ impl Daemon {
                 // Periodic full rescan.
                 _ = rescan_timer.tick() => {
                     debug!("periodic rescan");
-                    self.do_full_scan(&dbus_conn).await;
+                    self.do_full_scan().await;
                 }
 
                 // Recheck timer.
                 _ = recheck_timer.tick() => {
-                    self.do_rechecks(&dbus_conn).await;
+                    self.do_rechecks().await;
                 }
 
                 // GC timer.
@@ -361,11 +357,7 @@ impl Daemon {
     // Proc events
     // -----------------------------------------------------------------------
 
-    async fn handle_proc_event(
-        &mut self,
-        event:     ProcEvent,
-        dbus_conn: &Option<zbus::Connection>,
-    ) {
+    async fn handle_proc_event(&mut self, event: ProcEvent) {
         match event {
             ProcEvent::Fork { parent_pid, child_pid, child_tgid } => {
                 diag!("FORK", "parent={} child={} tgid={}", parent_pid, child_pid, child_tgid);
@@ -374,9 +366,7 @@ impl Daemon {
                         let count = self.forkbomb
                             .throttle_subtree(ppid, &self.table, &self.cgmgr)
                             .await;
-                        if let Some(ref conn) = dbus_conn {
-                            emit_fork_bomb(conn, ppid, count).await;
-                        }
+                        warn!("fork bomb: ppid={} throttled {} pids", ppid, count);
                         return;
                     }
                 }
@@ -406,7 +396,7 @@ impl Daemon {
                         // goes through the rule engine fresh.
                         self.table.insert(info.clone());
                         if !self.startup_phase {
-                            self.classify_and_apply(pid, &info, dbus_conn).await;
+                            self.classify_and_apply(pid, info).await;
                         } else {
                             debug!("startup phase: defer classification for pid {}", pid);
                         }
@@ -434,7 +424,7 @@ impl Daemon {
                         Ok(info) => {
                             self.table.insert(info.clone());
                             if !self.startup_phase {
-                                self.classify_and_apply(pid, &info, dbus_conn).await;
+                                self.classify_and_apply(pid, info).await;
                             } else {
                                 debug!("startup phase: defer classification for pid {}", pid);
                             }
@@ -447,16 +437,12 @@ impl Daemon {
     }
 
     // -----------------------------------------------------------------------
-    // D-Bus commands
+    // Control socket commands
     // -----------------------------------------------------------------------
 
-    async fn handle_dbus_cmd(
-        &mut self,
-        cmd:      DbusCommand,
-        dbus_conn: &Option<zbus::Connection>,
-    ) {
+    async fn handle_control_cmd(&mut self, cmd: ControlCommand) {
         match cmd {
-            DbusCommand::SetForegroundProcess(pid) => {
+            ControlCommand::SetForegroundProcess(pid) => {
                 if self.startup_phase {
                     info!("ignoring SetForegroundProcess during startup (pid={})", pid);
                     return;
@@ -464,20 +450,17 @@ impl Daemon {
                 info!("foreground pid → {}", pid);
                 self.state.lock().await.foreground_pid = Some(pid);
                 self.focus.set_foreground(pid, &self.table, &self.cgmgr).await;
-                if let Some(ref conn) = dbus_conn {
-                    emit_process_classified(conn, pid, "interactive", "foreground-boost").await;
-                }
             }
 
-            DbusCommand::SetProcessCgroup { pid, cgroup } => {
+            ControlCommand::SetProcessCgroup { pid, cgroup } => {
                 if let Some(tier) = CgroupTier::from_str(&cgroup) {
                     if let Err(e) = self.cgmgr.assign_pid(Some(tier), pid).await {
-                        warn!("D-Bus SetProcessCgroup pid={} cgroup={}: {}", pid, cgroup, e);
+                        warn!("control SetProcessCgroup pid={} cgroup={}: {}", pid, cgroup, e);
                     }
                 }
             }
 
-            DbusCommand::ReloadRules => {
+            ControlCommand::ReloadRules => {
                 match self.engine.reload(&self.config.daemon.rules_dir) {
                     Ok(_)  => info!("rules reloaded"),
                     Err(e) => warn!("rules reload failed: {}", e),
@@ -486,12 +469,7 @@ impl Daemon {
         }
     }
 
-    async fn classify_and_apply(
-        &mut self,
-        pid:        u32,
-        info:       &ProcessInfo,
-        dbus_conn:  &Option<zbus::Connection>,
-    ) {
+    async fn classify_and_apply(&mut self, pid: u32, mut info: ProcessInfo) {
         // Never classify our own process or its threads — we'd be moving
         // ourselves, which changes our own scheduling in undefined ways.
         let own_pid = std::process::id();
@@ -521,9 +499,16 @@ impl Daemon {
             return;
         }
 
+        // Lazily load /proc/pid/environ only when a loaded rule actually
+        // declares env_set — /proc/pid/environ can be several KB, so this
+        // must not run unconditionally on every classify.
+        if self.engine.wants_environ() && info.environ.is_empty() {
+            let _ = info.load_environ();
+        }
+
         let ancestors = self.table.ancestor_comms(pid, 10);
 
-        match self.engine.classify(info, &ancestors) {
+        match self.engine.classify(&info, &ancestors) {
             Some(action) => {
                 let cgroup_name = action.cgroup.clone().unwrap_or_else(|| "system".into());
                 let rule_name   = action.rule_name.clone();
@@ -566,10 +551,6 @@ impl Daemon {
                         rule_name: rule_name.clone(),
                     });
                 }
-
-                if let Some(ref conn) = dbus_conn {
-                    emit_process_classified(conn, pid, &cgroup_name, &rule_name).await;
-                }
             }
             None => {
                 // Only log NO_RULE for user processes — uid=0 system/init
@@ -588,39 +569,37 @@ impl Daemon {
     // Full scan
     // -----------------------------------------------------------------------
 
-    async fn do_full_scan(&mut self, dbus_conn: &Option<zbus::Connection>) {
-        let fresh = tokio::task::spawn_blocking(scan_proc)
+    async fn do_full_scan(&mut self) {
+        let known_pids = self.table.known_pids();
+        let scan_result = tokio::task::spawn_blocking(move || {
+            procmon::scan_proc_incremental(&known_pids)
+        })
             .await
-            .unwrap_or_default();
-        let count = fresh.len();
+            .unwrap_or_else(|_| procmon::ScanResult::default());
 
-        let unclassified: Vec<u32> = fresh
-            .iter()
-            .filter(|p| {
-                self.table
-                    .get(p.pid)
-                    .map(|e| !e.classified)
-                    .unwrap_or(true)
-            })
-            .map(|p| p.pid)
-            .collect();
+        let new_count = scan_result.new_processes.len();
+        let live_pids = scan_result.live_pids.clone();
 
-        // Build live-PID set before merge_scan consumes `fresh`.
-        let live_pids: std::collections::HashSet<u32> =
-            fresh.iter().map(|p| p.pid).collect();
+        self.table.merge_scan(scan_result.new_processes, &live_pids);
 
-        self.table.merge_scan(fresh);
+        // Any process whose `classified` flag is false — whether brand new
+        // this scan or an existing entry reset by e.g. swapstorm-recovery
+        // reclassification — needs (re)classification.  Querying the table
+        // directly post-merge (rather than re-deriving from the scan's own
+        // transient new-processes list) correctly picks up both cases.
+        let unclassified: Vec<u32> = self.table.unclassified_pids();
+
         tracing::info!(
-            "full scan: {} processes ({} new to classify)",
-            count, unclassified.len()
+            "full scan: {} live processes ({} new, {} to classify)",
+            live_pids.len(), new_count, unclassified.len()
         );
-        diag_section(&format!("SCAN {} procs {} new", count, unclassified.len()));
+        diag_section(&format!("SCAN {} procs {} new {} to classify", live_pids.len(), new_count, unclassified.len()));
 
-        // Bug 5 fix: GC the D-Bus managed map against the live PID set.
-        // merge_scan() already prunes ProcessTable, but SharedState::managed
-        // is a separate map that only gets cleaned on Exit events.  If an
-        // Exit event was dropped (netlink backpressure, kernel buffer overflow)
-        // the entry would leak forever without this sweep.
+        // GC the managed map against the live PID set.  merge_scan() already
+        // prunes ProcessTable, but SharedState::managed is a separate map
+        // that only gets cleaned on Exit events.  If an Exit event was
+        // dropped (netlink backpressure, kernel buffer overflow) the entry
+        // would leak forever without this sweep.
         {
             let mut state = self.state.lock().await;
             let before = state.managed.len();
@@ -631,18 +610,10 @@ impl Daemon {
             }
         }
 
-        // Suppress D-Bus signals during bulk classification — emitting hundreds
-        // of signals at boot floods the bus and slows startup significantly.
-        // Signals are still emitted for individual process events after startup.
         if !self.startup_phase {
-            let bulk = unclassified.len() > 10;
             for pid in unclassified {
                 if let Some(proc_info) = self.table.get(pid).map(|e| e.info.clone()) {
-                    self.classify_and_apply(
-                        pid,
-                        &proc_info,
-                        if bulk { &None } else { dbus_conn },
-                    ).await;
+                    self.classify_and_apply(pid, proc_info).await;
                 }
             }
         } else {
@@ -657,7 +628,7 @@ impl Daemon {
     // Recheck
     // -----------------------------------------------------------------------
 
-    async fn do_rechecks(&mut self, dbus_conn: &Option<zbus::Connection>) {
+    async fn do_rechecks(&mut self) {
         let expired = self.table.expired_rechecks();
         for pid in expired {
             // Do not re-insert or re-classify processes that the focus tracker
@@ -674,11 +645,11 @@ impl Daemon {
             match ProcessInfo::from_pid(pid) {
                 Ok(proc_info) => {
                     self.table.insert(proc_info.clone());
-                    self.classify_and_apply(pid, &proc_info, dbus_conn).await;
+                    self.classify_and_apply(pid, proc_info).await;
                 }
                 Err(_) => {
-                    // Bug 1 fix: remove from both stores so the D-Bus managed
-                    // map doesn't accumulate ghost entries for dead processes.
+                    // Remove from both stores so the managed map doesn't
+                    // accumulate ghost entries for dead processes.
                     self.table.remove(pid);
                     self.state.lock().await.managed.remove(&pid);
                 }

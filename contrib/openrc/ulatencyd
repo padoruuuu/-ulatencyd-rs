@@ -13,7 +13,6 @@ pidfile="/run/ulatencyd.pid"
 start_stop_daemon_args="--background --make-pidfile"
 
 depend() {
-    need dbus
     use logger
     after bootmisc
 }

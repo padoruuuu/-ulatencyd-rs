@@ -3,9 +3,6 @@ name    = "rules"
 version = "0.1.0"
 edition = "2021"
 
-[features]
-scripting = ["dep:rhai"]
-
 [dependencies]
 procmon   = { path = "../procmon" }
 anyhow    = { workspace = true }
@@ -14,4 +11,3 @@ tracing   = { workspace = true }
 serde     = { workspace = true }
 toml      = { workspace = true }
 wildmatch = { workspace = true }
-rhai      = { version = "1", optional = true }

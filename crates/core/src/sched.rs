@@ -5,10 +5,16 @@
 //!   CONSERVATIVE — battery, server (kernel defaults)
 //!
 //! Autogroup disabling is the single highest-impact change (Learning 1).
+//!
+//! Power-source detection previously subscribed to UPower over D-Bus with a
+//! sysfs-polling fallback for systems without it. Since the daemon no longer
+//! talks D-Bus at all, this is now sysfs-only — which is in fact a strict
+//! simplification, not a regression: UPower itself derives `OnBattery` from
+//! the same `/sys/class/power_supply` data this module already reads
+//! directly, just with an extra D-Bus hop in between.
 
 use anyhow::Result;
 use tracing::{debug, info, warn};
-use zbus;
 
 // ---------------------------------------------------------------------------
 // Profiles
@@ -199,7 +205,7 @@ fn write_sysctl(key: &str, value: u64) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Power state detection (fallback for systems without UPower)
+// Power state detection (sysfs — no D-Bus dependency)
 // ---------------------------------------------------------------------------
 
 /// Detect current power source from `/sys/class/power_supply/`.
@@ -210,7 +216,6 @@ fn write_sysctl(key: &str, value: u64) -> Result<()> {
 ///
 /// On a desktop with no battery at all, both conditions are false → AC.
 /// USB hubs and UPS entries (type ≠ Mains / Battery) are ignored.
-/// Used when UPower D-Bus is unavailable (runit/minimal systems).
 pub fn detect_power_state_sysfs() -> PowerState {
     let ps_dir = std::path::Path::new("/sys/class/power_supply");
     let Ok(entries) = std::fs::read_dir(ps_dir) else {
@@ -255,75 +260,28 @@ pub fn detect_power_state_sysfs() -> PowerState {
     }
 }
 
-/// Monitor power state changes using UPower D-Bus.
-/// Falls back to sysfs polling if UPower is not available.
+/// Monitor power state by polling sysfs every 5 seconds.
 /// Returns a watch receiver of PowerState.
+///
+/// 5s (rather than the previous D-Bus fallback's 30s) keeps AC↔battery
+/// transitions reasonably prompt now that sysfs polling is the *only*
+/// detection path rather than a rarely-used fallback.
 pub async fn monitor_power_state() -> tokio::sync::watch::Receiver<PowerState> {
     let initial = detect_power_state_sysfs();
     let (tx, rx) = tokio::sync::watch::channel(initial);
 
     tokio::spawn(async move {
-        // Try to subscribe to UPower via D-Bus.
-        match subscribe_upower(tx.clone()).await {
-            Ok(_) => {} // UPower task took over
-            Err(e) => {
-                tracing::info!("UPower not available ({}), polling sysfs every 30s", e);
-                // Fall back to polling sysfs.
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                    let new_state = detect_power_state_sysfs();
-                    // Only send when the state actually changed; sending the
-                    // same value every tick would mark the watch as modified
-                    // and cause the daemon's power handler to fire spuriously.
-                    if *tx.borrow() != new_state {
-                        if tx.send(new_state).is_err() { break; }
-                    }
-                }
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let new_state = detect_power_state_sysfs();
+            // Only send when the state actually changed; sending the same
+            // value every tick would mark the watch as modified and cause
+            // the daemon's power handler to fire spuriously.
+            if *tx.borrow() != new_state {
+                if tx.send(new_state).is_err() { break; }
             }
         }
     });
 
     rx
-}
-
-async fn subscribe_upower(tx: tokio::sync::watch::Sender<PowerState>) -> anyhow::Result<()> {
-    use futures_util::StreamExt as _;
-
-    let conn = zbus::Connection::system().await?;
-
-    let proxy = zbus::Proxy::new(
-        &conn,
-        "org.freedesktop.UPower",
-        "/org/freedesktop/UPower",
-        "org.freedesktop.UPower",
-    ).await?;
-
-    // Read initial value.
-    let on_battery: bool = proxy.get_property("OnBattery").await?;
-    let _ = tx.send(if on_battery { PowerState::Battery } else { PowerState::AC });
-
-    // Subscribe to PropertiesChanged via fdo::PropertiesProxy.
-    let props = zbus::fdo::PropertiesProxy::builder(&conn)
-        .destination("org.freedesktop.UPower")?
-        .path("/org/freedesktop/UPower")?
-        .build()
-        .await?;
-
-    let mut stream = props.receive_properties_changed().await?;
-
-    while let Some(signal) = stream.next().await {
-        let args = signal.args()?;
-        if args.interface_name().as_str() == "org.freedesktop.UPower" {
-            if let Some(val) = args.changed_properties().get("OnBattery") {
-                // val is &zvariant::Value<'_>
-                if let Ok(on_bat) = bool::try_from(val) {
-                    let state = if on_bat { PowerState::Battery } else { PowerState::AC };
-                    info!("power state changed: {:?}", state);
-                    if tx.send(state).is_err() { break; }
-                }
-            }
-        }
-    }
-
-    Ok(())
 }

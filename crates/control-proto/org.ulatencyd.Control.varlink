@@ -1,0 +1,24 @@
+interface org.ulatencyd.Control
+
+type ProcessRecord (
+    pid: int,
+    comm: string,
+    cgroup: string,
+    rule: string
+)
+
+type PressureMetrics (
+    some_avg10: float, some_avg60: float, some_avg300: float,
+    full_avg10: float, full_avg60: float, full_avg300: float
+)
+
+method Status() -> (version: string, mode: string, process_count: int, uptime_secs: int)
+method ListManagedProcesses() -> (processes: []ProcessRecord)
+method GetProcessInfo(pid: int) -> (process: ProcessRecord)
+method GetSystemPressure() -> (memory: PressureMetrics, io: PressureMetrics, cpu_some_avg10: float)
+method ReloadRules() -> ()
+method SetProcessCgroup(pid: int, cgroup: string) -> ()
+method SetForegroundProcess(pid: int) -> ()
+
+error UnknownPid (pid: int)
+error DaemonUnavailable ()

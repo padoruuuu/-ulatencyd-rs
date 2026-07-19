@@ -72,11 +72,8 @@ pub struct ProcessInfo {
     pub comm:           String,
     pub cmdline:        Vec<String>,
     pub exe:            Option<PathBuf>,
-    pub oom_score:      i32,
     pub threads:        u32,
     pub vm_rss_kb:      u64,
-    pub io_read_bytes:  u64,
-    pub io_write_bytes: u64,
     pub sched_policy:   SchedPolicy,
     pub nice:           i8,
     pub cgroup_path:    Option<String>,
@@ -112,22 +109,16 @@ impl ProcessInfo {
         // Kernel threads have uid=0 and no exe symlink target.
         let is_kernel_thread = uid == 0 && exe.is_none() && cmdline.is_empty();
 
-        let oom_score = std::fs::read_to_string(format!("{}/oom_score", proc))
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0);
-
         let cgroup_path = read_cgroup_v2(pid);
         let session_origin = cgroup_path.as_deref()
             .map(|p| SessionOrigin::from_cgroup_path(p, uid, "ulatencyd"))
             .unwrap_or(SessionOrigin::Unknown);
 
-        let (io_read_bytes, io_write_bytes) = read_io(pid).unwrap_or((0, 0));
         let sched_policy = get_sched_policy(pid as i32);
 
         Ok(ProcessInfo {
-            pid, ppid, uid, gid, comm, cmdline, exe, oom_score,
-            threads, vm_rss_kb, io_read_bytes, io_write_bytes,
+            pid, ppid, uid, gid, comm, cmdline, exe,
+            threads, vm_rss_kb,
             sched_policy, nice, cgroup_path, session_origin,
             is_kernel_thread, environ: HashMap::new(),
         })
@@ -185,16 +176,6 @@ fn read_cgroup_v2(pid: u32) -> Option<String> {
         }
     }
     None
-}
-
-fn read_io(pid: u32) -> anyhow::Result<(u64, u64)> {
-    let content = std::fs::read_to_string(format!("/proc/{}/io", pid))?;
-    let (mut rb, mut wb) = (0u64, 0u64);
-    for line in content.lines() {
-        if let Some(v) = line.strip_prefix("read_bytes: ")  { rb = v.trim().parse().unwrap_or(0); }
-        if let Some(v) = line.strip_prefix("write_bytes: ") { wb = v.trim().parse().unwrap_or(0); }
-    }
-    Ok((rb, wb))
 }
 
 fn get_sched_policy(pid: i32) -> SchedPolicy {
