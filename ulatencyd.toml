@@ -27,5 +27,10 @@ lineage_depth        = 5    # how many generations to throttle
 autogroup_enabled = false   # disable kernel autogroup for better cgroup isolation
 detect_and_defer  = true    # skip cpu.weight when sched_ext is active
 
-[dbus]
+[control_socket]
 enabled = true
+path    = "/run/ulatencyd/control.sock"
+# Group allowed to connect (directory + socket are chowned to this group and
+# set to 0750/0660 at startup). Create this system group before installing:
+#   groupadd --system ulatencyd
+group   = "ulatencyd"

@@ -19,18 +19,18 @@ pub struct Config {
     #[serde(default)]
     pub sched: SchedConfig,
     #[serde(default)]
-    pub dbus: DbusConfig,
+    pub control_socket: ControlSocketConfig,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            daemon:    DaemonConfig::default(),
-            cgroups:   CgroupsConfig::default(),
-            pressure:  PsiConfig::default(),
-            fork_bomb: ForkBombConfig::default(),
-            sched:     SchedConfig::default(),
-            dbus:      DbusConfig::default(),
+            daemon:         DaemonConfig::default(),
+            cgroups:        CgroupsConfig::default(),
+            pressure:       PsiConfig::default(),
+            fork_bomb:      ForkBombConfig::default(),
+            sched:          SchedConfig::default(),
+            control_socket: ControlSocketConfig::default(),
         }
     }
 }
@@ -92,13 +92,21 @@ impl Default for SchedConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DbusConfig {
+pub struct ControlSocketConfig {
     pub enabled: bool,
+    pub path:    PathBuf,
+    /// Group that owns the socket and its parent directory. Only members of
+    /// this group can connect — see crates/core/src/control.rs §5.
+    pub group:   String,
 }
 
-impl Default for DbusConfig {
+impl Default for ControlSocketConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            path:    PathBuf::from("/run/ulatencyd/control.sock"),
+            group:   "ulatencyd".into(),
+        }
     }
 }
 

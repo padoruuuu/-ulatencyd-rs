@@ -1,0 +1,30 @@
+[workspace]
+# Deliberately empty — this crate is NOT a member of the main
+# ulatencyd-rs workspace. It is built and packaged completely
+# independently (see README.md), so its dependency graph (zbus, etc.)
+# never appears in `cargo tree` from the repo root and never affects
+# dependency resolution for the daemon or CLI.
+
+[package]
+name    = "system76-compat-shim"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ulatencyd-system76-shim"
+path = "src/main.rs"
+
+[build-dependencies]
+varlink_generator = "13"
+
+[dependencies]
+tokio     = { version = "1", features = ["rt", "macros", "sync", "signal"] }
+zbus      = { version = "4", default-features = false, features = ["tokio"] }
+varlink   = { version = "13", features = ["tokio"] }
+async-trait = "0.1"
+serde       = { version = "1", features = ["derive"] }
+serde_derive = "1"
+serde_json  = "1"
+anyhow      = "1"
+tracing     = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

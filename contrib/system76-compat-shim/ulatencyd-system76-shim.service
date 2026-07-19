@@ -1,0 +1,30 @@
+[Unit]
+Description=ulatencyd-rs — com.system76.Scheduler D-Bus compatibility shim
+Documentation=https://github.com/padoruuuu/-ulatencyd-rs
+# Optional. Only enable this if something on your system specifically
+# requires the historical com.system76.Scheduler D-Bus interface — most
+# desktops have no need for it. See contrib/system76-compat-shim/README.md.
+After=ulatencyd.service dbus.service
+Requires=ulatencyd.service
+Wants=dbus.service
+BindsTo=ulatencyd.service
+
+[Service]
+Type=dbus
+BusName=com.system76.Scheduler
+ExecStart=/usr/libexec/ulatencyd-system76-shim
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=10
+TimeoutStopSec=5
+
+# Needs to reach the control socket in the ulatencyd group, plus the system
+# D-Bus socket. No elevated Linux capabilities are needed at all — this
+# binary only makes two client connections and relays calls between them.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

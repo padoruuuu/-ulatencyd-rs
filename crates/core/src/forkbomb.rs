@@ -2,8 +2,7 @@
 //!
 //! Tracks per-parent fork rates in a sliding 1-second window.
 //! When a parent exceeds `threshold` forks/sec, its entire subtree is
-//! moved to the `swapstorm` cgroup (heavily restricted) and a D-Bus
-//! signal is emitted.
+//! moved to the `swapstorm` cgroup (heavily restricted).
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -125,20 +124,26 @@ impl ForkBombDetector {
     }
 
     /// Throttle a subtree rooted at `ppid` by moving all PIDs to swapstorm.
+    /// Issues all cgroup.procs writes concurrently — a sequential loop here
+    /// would be slowest exactly when speed matters most (an active fork
+    /// bomb can mean hundreds of PIDs to move).
     pub async fn throttle_subtree(
         &self,
         ppid: u32,
         table: &ProcessTable,
         cgmgr: &CgroupManager,
     ) -> u32 {
+        use futures_util::future::join_all;
+
         let pids = self.collect_subtree(ppid, table, self.lineage_depth);
         let count = pids.len() as u32;
         info!(
             "throttling {} pids in subtree of ppid={} → swapstorm",
             count, ppid
         );
-        for pid in pids {
-            if let Err(e) = cgmgr.assign_pid(Some(CgroupTier::Swapstorm), pid).await {
+        let futs = pids.iter().map(|&pid| cgmgr.assign_pid(Some(CgroupTier::Swapstorm), pid));
+        for (pid, result) in pids.iter().zip(join_all(futs).await) {
+            if let Err(e) = result {
                 warn!("throttle pid {}: {}", pid, e);
             }
         }

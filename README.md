@@ -15,17 +15,23 @@ Project: https://github.com/padoruuuu/-ulatencyd-rs
 | **Rule engine** | TOML rules with glob matching, priority, profile inheritance |
 | **PSI monitoring** | `/proc/pressure/*` every 500 ms; classifies Normal/Low/High/Critical |
 | **Fork-bomb detection** | Sliding-window rate limit per parent; throttles subtree to `swapstorm` |
-| **Power-aware profiles** | Switches CFS latency knobs on AC ↔ battery via UPower or sysfs |
+| **Power-aware profiles** | Switches CFS latency knobs on AC ↔ battery via sysfs |
 | **sched_ext aware** | Detects active BPF schedulers, skips `cpu.weight` writes |
-| **D-Bus API** | `org.ulatencyd.Ulatencyd1` on the system bus |
+| **Control socket** | `org.ulatencyd.Control` over a local varlink Unix socket — no D-Bus |
 | **Init-agnostic** | systemd, runit, s6, OpenRC, SysV — one binary |
 | **sd_notify** | `READY=1` / `STOPPING=1` / `STATUS=` for any supervisor with `NOTIFY_SOCKET` |
+
+ulatencyd-rs does not use D-Bus at all. Its control interface is a local
+varlink socket gated by Unix group membership (see [Control
+socket](#control-socket)). If you need the historical
+`com.system76.Scheduler` D-Bus interface for desktop-integration
+compatibility, see the optional, standalone
+[`contrib/system76-compat-shim`](contrib/system76-compat-shim/README.md).
 
 ## Requirements
 
 - Linux kernel ≥ 5.14 (cgroup v2 unified hierarchy, `cgroup.kill`)
 - Rust ≥ 1.82 (install via [rustup](https://rustup.rs), **not** distro packages)
-- D-Bus system daemon
 - Root privileges (or appropriate capabilities: `CAP_SYS_NICE`, `CAP_NET_ADMIN`)
 
 ## Build
@@ -48,19 +54,24 @@ cargo build --release
 ## Install
 
 ```bash
-sudo bash install.sh
+sudo make install
 ```
+
+This automates the group setup below (creates the `ulatencyd` group and
+adds whoever ran `sudo`); to add another user to it later:
+`sudo make enable-user USER_TO_ADD=<username>`.
 
 Or manually:
 
 ```bash
+sudo groupadd --system ulatencyd            # controls who can use ulatencyctl
+sudo usermod -aG ulatencyd <your user>
+
 sudo install -m755 target/release/ulatencyd    /usr/sbin/ulatencyd
 sudo install -m755 target/release/ulatencyctl  /usr/bin/ulatencyctl
 sudo install -dm755 /etc/ulatencyd/rules /usr/lib/ulatencyd/rules
 sudo install -m644 ulatencyd.toml  /etc/ulatencyd/ulatencyd.toml
 sudo install -m644 rules/*.toml    /usr/lib/ulatencyd/rules/
-sudo install -m644 contrib/dbus/org.ulatencyd.Ulatencyd1.conf \
-    /etc/dbus-1/system.d/org.ulatencyd.Ulatencyd1.conf
 ```
 
 ### systemd
@@ -112,12 +123,37 @@ threshold_per_second = 50     # forks/sec from one parent → throttle
 
 [sched]
 autogroup_enabled = false     # disable kernel autogroup (recommended)
+
+[control_socket]
+enabled = true
+path    = "/run/ulatencyd/control.sock"
+group   = "ulatencyd"          # who can connect (see Control socket below)
+```
+
+## Control socket
+
+ulatencyd-rs exposes a control/query interface over
+[varlink](https://varlink.org) instead of D-Bus, on a local Unix socket
+(default `/run/ulatencyd/control.sock`). The interface definition lives at
+[`crates/control-proto/org.ulatencyd.Control.varlink`](crates/control-proto/org.ulatencyd.Control.varlink).
+
+Access control is by Unix group membership rather than polkit: the socket
+and its parent directory are owned `root:<control_socket.group>` with modes
+`0660`/`0750`. Add yourself (or any client) to that group to use
+`ulatencyctl`:
+
+```bash
+sudo groupadd --system ulatencyd   # if it doesn't already exist
+sudo usermod -aG ulatencyd $USER
+# log out/in (or `newgrp ulatencyd`) for the new group membership to apply
 ```
 
 ## Writing Rules
 
 Rules live in `/etc/ulatencyd/rules/*.toml` and `/usr/lib/ulatencyd/rules/*.toml`.
-Files are loaded in alphabetical order; `/etc/` takes precedence.
+Files are loaded in alphabetical order; `/etc/` takes precedence. Unknown
+keys in a `[[rule]]`, `[rule.match]`, `[rule.action]`, or `[[profile]]` block
+are a load-time error, not a silently-ignored typo.
 
 ```toml
 [[rule]]
@@ -148,6 +184,10 @@ apply_to_children = true       # also apply to all direct children
 continue        = false        # set true to keep matching lower-priority rules
 ```
 
+Note: `env_set` matching reads `/proc/pid/environ`, which can be a few KB per
+process — the daemon only pays for that read at all when at least one loaded
+rule actually declares `env_set`.
+
 ### Cgroup tiers
 
 | Tier | `cpu.weight` | `io.weight` | Notes |
@@ -169,8 +209,11 @@ ulatencyctl pressure            # current PSI values
 ulatencyctl reload              # hot-reload rules from disk
 ulatencyctl set-cgroup <pid> background   # manually move a PID
 ulatencyctl set-foreground <pid>          # hint: window manager focus change
-ulatencyctl watch-signals       # stream D-Bus signals to stdout
+ulatencyctl run background -- make -j8    # run a command under a tier
 ```
+
+(There is no `watch-signals` — varlink has no D-Bus-signal equivalent to
+subscribe to. Poll `status`/`list` instead.)
 
 ## Architecture
 
@@ -187,21 +230,30 @@ ulatencyctl watch-signals       # stream D-Bus signals to stdout
                     │     └── ExceptionList        └── /sys/  │
                     │                                 fs/cgroup│
                     │  ForkBombDetector                        │
-                    │  D-Bus Interface ◄──────────────────────►│ ulatencyctl
+                    │  Control socket (varlink) ◄─────────────►│ ulatencyctl
                     └─────────────────────────────────────────┘
 ```
+
+Need `com.system76.Scheduler` on D-Bus for desktop-integration
+compatibility? That's a separate, optional process
+(`contrib/system76-compat-shim`) sitting entirely outside this diagram,
+translating D-Bus calls onto the control socket above like any other client.
 
 ## Crate structure
 
 | Crate | Purpose |
 |---|---|
-| `procmon` | `/proc` parser, netlink proc connector, full scan |
+| `procmon` | `/proc` parser, netlink proc connector, full + incremental scan |
 | `cgroupv2` | cgroup v2 hierarchy manager |
 | `psi` | PSI pressure reader and classifier |
 | `rules` | TOML rule engine with wildmatch and profile inheritance |
-| `dbus-api` | zbus 4 D-Bus interface + signal emitters |
-| `core` (`ulatencyd`) | Main daemon binary: event loop, applier, fork-bomb, power, signals |
-| `cli` (`ulatencyctl`) | D-Bus client CLI |
+| `control-proto` | Shared `org.ulatencyd.Control` varlink schema (not a crate — see its README) |
+| `core` (`ulatencyd`) | Main daemon binary: event loop, applier, fork-bomb, power, signals, control socket |
+| `cli` (`ulatencyctl`) | Control-socket client CLI (sync varlink) |
+
+`contrib/system76-compat-shim` is a separate, standalone crate (own
+`Cargo.toml`, own workspace) — see its own README for why it's not listed
+here as a workspace member.
 
 ## License
 
