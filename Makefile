@@ -21,7 +21,7 @@ SRCDIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 build:
 	cd $(SRCDIR) && cargo build $(CARGO_FLAGS)
 
-# Creates the system group referenced by ulatencyd.toml's [control_socket]
+# Creates the system group referenced by ulatencyd.json's [control_socket]
 # section (default: ulatencyd) and adds whoever ran `sudo make install` to
 # it. Skipped entirely when DESTDIR is set — that means we're being
 # packaged into a fakeroot (e.g. makepkg), where mutating the real system's
@@ -100,11 +100,11 @@ install-services:
 
 install-rules:
 	install -dm755 $(RULESDIR)
-	install -m644  $(SRCDIR)rules/*.toml $(RULESDIR)/
+	install -m644  $(SRCDIR)rules/*.json $(RULESDIR)/
 
 install-config:
 	install -dm755 $(CONFDIR)/rules
-	test -f $(CONFDIR)/ulatencyd.toml || install -m644 $(SRCDIR)ulatencyd.toml $(CONFDIR)/ulatencyd.toml
+	test -f $(CONFDIR)/ulatencyd.json || install -m644 $(SRCDIR)ulatencyd.json $(CONFDIR)/ulatencyd.json
 
 # Optional: com.system76.Scheduler D-Bus compatibility shim. This is a
 # separate, standalone crate (its own Cargo.toml with an empty [workspace])
@@ -162,8 +162,8 @@ pkg:
 	@echo "package() {" >> PKGBUILD.tmp
 	@echo "  install -Dm755 target/release/ulatencyd   \"\$$pkgdir/usr/sbin/ulatencyd\"" >> PKGBUILD.tmp
 	@echo "  install -Dm755 target/release/ulatencyctl \"\$$pkgdir/usr/bin/ulatencyctl\"" >> PKGBUILD.tmp
-	@echo "  install -Dm644 rules/*.toml -t \"\$$pkgdir/usr/lib/ulatencyd/rules\"" >> PKGBUILD.tmp
-	@echo "  install -Dm644 ulatencyd.toml \"\$$pkgdir/etc/ulatencyd/ulatencyd.toml\"" >> PKGBUILD.tmp
+	@echo "  install -Dm644 rules/*.json -t \"\$$pkgdir/usr/lib/ulatencyd/rules\"" >> PKGBUILD.tmp
+	@echo "  install -Dm644 ulatencyd.json \"\$$pkgdir/etc/ulatencyd/ulatencyd.json\"" >> PKGBUILD.tmp
 	@echo "  install -Dm644 contrib/systemd/ulatencyd.service \"\$$pkgdir/lib/systemd/system/ulatencyd.service\"" >> PKGBUILD.tmp
 	@echo "}" >> PKGBUILD.tmp
 	@echo "post_install() {" > ulatencyd-rs.install

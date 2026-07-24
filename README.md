@@ -70,8 +70,8 @@ sudo usermod -aG ulatencyd <your user>
 sudo install -m755 target/release/ulatencyd    /usr/sbin/ulatencyd
 sudo install -m755 target/release/ulatencyctl  /usr/bin/ulatencyctl
 sudo install -dm755 /etc/ulatencyd/rules /usr/lib/ulatencyd/rules
-sudo install -m644 ulatencyd.toml  /etc/ulatencyd/ulatencyd.toml
-sudo install -m644 rules/*.toml    /usr/lib/ulatencyd/rules/
+sudo install -m644 ulatencyd.json  /etc/ulatencyd/ulatencyd.json
+sudo install -m644 rules/*.json    /usr/lib/ulatencyd/rules/
 ```
 
 ### systemd
@@ -106,29 +106,39 @@ sudo rc-service ulatencyd start
 
 ## Configuration
 
-Edit `/etc/ulatencyd/ulatencyd.toml`. All keys have sensible defaults:
+Edit `/etc/ulatencyd/ulatencyd.json`. All keys have sensible defaults:
 
-```toml
-[daemon]
-log_level = "info"
-rescan_interval_secs = 30
-apply_to_existing_processes = true
-
-[pressure]
-memory_low_threshold  = 5.0   # % PSI stall before "low" pressure
-memory_high_threshold = 40.0  # % PSI stall before "high" pressure
-
-[fork_bomb]
-threshold_per_second = 50     # forks/sec from one parent → throttle
-
-[sched]
-autogroup_enabled = false     # disable kernel autogroup (recommended)
-
-[control_socket]
-enabled = true
-path    = "/run/ulatencyd/control.sock"
-group   = "ulatencyd"          # who can connect (see Control socket below)
+```json
+{
+  "daemon": {
+    "log_level": "info",
+    "rescan_interval_secs": 30,
+    "apply_to_existing_processes": true
+  },
+  "pressure": {
+    "memory_low_threshold": 5.0,
+    "memory_high_threshold": 40.0
+  },
+  "fork_bomb": {
+    "threshold_per_second": 50
+  },
+  "sched": {
+    "autogroup_enabled": false
+  },
+  "control_socket": {
+    "enabled": true,
+    "path": "/run/ulatencyd/control.sock",
+    "group": "ulatencyd"
+  }
+}
 ```
+
+- `pressure.memory_low_threshold` / `memory_high_threshold` — % PSI stall before "low" / "high" pressure
+- `fork_bomb.threshold_per_second` — forks/sec from one parent → throttle
+- `sched.autogroup_enabled` — disable kernel autogroup (recommended: `false`)
+- `control_socket.group` — who can connect (see Control socket below)
+
+JSON has no comment syntax; omit any section to use its defaults instead of copying the whole file.
 
 ## Control socket
 
@@ -150,39 +160,62 @@ sudo usermod -aG ulatencyd $USER
 
 ## Writing Rules
 
-Rules live in `/etc/ulatencyd/rules/*.toml` and `/usr/lib/ulatencyd/rules/*.toml`.
+Rules live in `/etc/ulatencyd/rules/*.json` and `/usr/lib/ulatencyd/rules/*.json`.
 Files are loaded in alphabetical order; `/etc/` takes precedence. Unknown
-keys in a `[[rule]]`, `[rule.match]`, `[rule.action]`, or `[[profile]]` block
-are a load-time error, not a silently-ignored typo.
+keys in a rule, `match`, or `action` object are a load-time error, not a
+silently-ignored typo. Since JSON has no comment syntax, both `rule` and
+`action` objects accept an optional `note` string field — purely
+documentation, ignored by the daemon — as the place to put the "why" that
+would otherwise be a TOML comment.
 
-```toml
-[[rule]]
-name     = "my-audio-server"
-priority = 90          # higher wins; first match stops evaluation
-
-[rule.match]
-comm           = ["jackd"]          # exact process name
-comm_prefix    = ["my-"]            # prefix match
-cmdline_contains = ["--realtime"]   # substring in joined cmdline
-exe_path       = ["/usr/bin/jackd"] # exact executable path
-uid            = [1000]             # only for this user
-env_set        = ["JACK_DEFAULT_SERVER"]  # env var must exist
-min_threads    = 4                  # at least 4 threads
-min_rss_mb     = 100                # at least 100 MB RSS
-parent_comm    = ["jackd"]          # parent process name
-cgroup_path    = "/user.slice/*"    # wildmatch on v2 cgroup path
-
-[rule.action]
-cgroup          = "rt"         # rt|interactive|system|background|idle|swapstorm
-nice            = -10          # -20..19
-sched_policy    = "fifo"       # normal|batch|idle|fifo|rr
-sched_priority  = 80           # 1..99 (for fifo/rr)
-oom_score_adj   = -900         # -1000..1000
-io_weight       = 9000         # 1..10000
-recheck_secs    = 60           # re-evaluate after N seconds
-apply_to_children = true       # also apply to all direct children
-continue        = false        # set true to keep matching lower-priority rules
+```json
+{
+  "rule": [
+    {
+      "name": "my-audio-server",
+      "priority": 90,
+      "note": "higher priority wins; first match stops evaluation",
+      "match": {
+        "comm": ["jackd"],
+        "comm_prefix": ["my-"],
+        "cmdline_contains": ["--realtime"],
+        "exe_path": ["/usr/bin/jackd"],
+        "uid": [1000],
+        "env_set": ["JACK_DEFAULT_SERVER"],
+        "min_threads": 4,
+        "min_rss_mb": 100,
+        "parent_comm": ["jackd"],
+        "cgroup_path": "/user.slice/*"
+      },
+      "action": {
+        "cgroup": "rt",
+        "nice": -10,
+        "sched_policy": "fifo",
+        "sched_priority": 80,
+        "oom_score_adj": -900,
+        "io_weight": 9000,
+        "recheck_secs": 60,
+        "apply_to_children": true,
+        "continue": false
+      }
+    }
+  ]
+}
 ```
+
+Field notes: `comm` is an exact process name match, `comm_prefix` a prefix
+match, `cmdline_contains` a substring of the joined cmdline, `exe_path` an
+exact executable path, `uid` restricts to specific users, `env_set` requires
+an environment variable to exist, `min_threads`/`min_rss_mb` are minimum
+thresholds, `parent_comm` matches the parent process name, and `cgroup_path`
+is a wildmatch on the v2 cgroup path. `action.cgroup` is one of
+`rt|interactive|system|background|idle|swapstorm`, `nice` is `-20..19`,
+`sched_policy` is `normal|batch|idle|fifo|rr`, `sched_priority` is `1..99`
+(for `fifo`/`rr`), `oom_score_adj` is `-1000..1000`, `io_weight` is
+`1..10000`, `recheck_secs` re-evaluates the rule after N seconds,
+`apply_to_children` also applies the cgroup to all direct children, and
+`continue: true` keeps matching lower-priority rules instead of stopping at
+the first match.
 
 Note: `env_set` matching reads `/proc/pid/environ`, which can be a few KB per
 process — the daemon only pays for that read at all when at least one loaded

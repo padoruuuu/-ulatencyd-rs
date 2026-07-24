@@ -1,0 +1,56 @@
+{
+  "rule": [
+    {
+      "name": "pipewire",
+      "priority": 90,
+      "match": {
+        "comm": [
+          "pipewire",
+          "pipewire-pulse",
+          "pipewire-alsa"
+        ]
+      },
+      "action": {
+        "oom_score_adj": -900
+      },
+      "note": "File: audio daemons. pipewire/wireplumber/pulseaudio/jackd use session-scoped Unix sockets \u2014 moving them out of their session scope breaks audio for all other session processes, so they're left in no_cgroup_move; only oom_score_adj is applied here. Scheduling (SCHED_FIFO) is managed by rtkit-daemon, not by us."
+    },
+    {
+      "name": "wireplumber",
+      "priority": 88,
+      "match": {
+        "comm": [
+          "wireplumber"
+        ]
+      },
+      "action": {
+        "oom_score_adj": -800
+      }
+    },
+    {
+      "name": "jackd",
+      "priority": 90,
+      "match": {
+        "comm": [
+          "jackd",
+          "jackdbus"
+        ]
+      },
+      "action": {
+        "oom_score_adj": -900
+      }
+    },
+    {
+      "name": "pulseaudio",
+      "priority": 85,
+      "match": {
+        "comm": [
+          "pulseaudio"
+        ]
+      },
+      "action": {
+        "oom_score_adj": -800
+      }
+    }
+  ]
+}

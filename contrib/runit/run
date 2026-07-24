@@ -3,7 +3,7 @@
 #
 # No D-Bus wait needed: the daemon's control interface is a local varlink
 # Unix socket it creates itself at startup (see [control_socket] in
-# ulatencyd.toml), not a D-Bus service name that depends on dbus-daemon/
+# ulatencyd.json), not a D-Bus service name that depends on dbus-daemon/
 # dbus-broker already running.
 
 exec /usr/sbin/ulatencyd 2>&1

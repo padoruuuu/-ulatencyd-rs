@@ -10,34 +10,37 @@
 //!   - control socket command receiver
 //!   - power-aware sched profile switching
 //!   - SIGHUP (reload) / SIGTERM (graceful shutdown)
+//!
+//! Every source above runs on its own dedicated OS thread and pushes an
+//! `Event` into one shared `std::sync::mpsc::Sender<Event>` (all spawned by
+//! `main.rs`). This function's `run()` loop is a single blocking
+//! `for event in event_rx.iter()`, replacing the old `tokio::select!` loop.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tokio::sync::Mutex;
-use tokio::time;
 use tracing::{debug, info, warn};
 
 use cgroupv2::{CgroupManager, CgroupTier};
-use procmon::{ProcEvent, ProcessInfo, ProcMonitor};
-use psi::{PressureLevel, spawn_psi_monitor};
+use procmon::{ProcEvent, ProcessInfo};
+use psi::PressureLevel;
 use rules::RuleEngine;
 
 use crate::applier::{apply_action, apply_cgroup_only};
 use crate::config::Config;
 use crate::control::{ControlCommand, ProcessEntry, SharedState};
 use crate::diag::{diag, diag_section};
+use crate::event::Event;
 use crate::focus::ForegroundTracker;
 use crate::forkbomb::ForkBombDetector;
 use crate::init::InitSystem;
 use crate::process_table::ProcessTable;
 use crate::sched::{
     AutogroupGuard, PowerState, apply_sched_profile,
-    monitor_power_state, probe_preempt_model_switchable, probe_sched_latency_ns,
+    probe_preempt_model_switchable, probe_sched_latency_ns,
     CONSERVATIVE, RESPONSIVE,
 };
-use crate::signal::ShutdownToken;
 
 // ---------------------------------------------------------------------------
 // Daemon
@@ -51,7 +54,7 @@ pub struct Daemon {
     forkbomb: ForkBombDetector,
     focus:    ForegroundTracker,
     state:    Arc<Mutex<SharedState>>,
-    startup_deadline: tokio::time::Instant,
+    startup_deadline: Instant,
     startup_phase:    bool,
     /// Probed once at startup: true on CFS kernels (< 6.6), false on EEVDF.
     sched_latency_ns_available: bool,
@@ -62,10 +65,12 @@ pub struct Daemon {
     /// and suppress spurious handler invocations when the polled value is
     /// unchanged.
     last_power_source: Option<PowerState>,
+    /// Last classified system-wide pressure level.
+    last_pressure_level: PressureLevel,
 }
 
 impl Daemon {
-    pub async fn new(
+    pub fn new(
         config:     Config,
         cgmgr:      CgroupManager,
         state:      Arc<Mutex<SharedState>>,
@@ -89,8 +94,7 @@ impl Daemon {
         // typically start after the session is ready, so a shorter window
         // is safe.
         let grace_secs = init_system.startup_grace_secs();
-        let startup_deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_secs(grace_secs);
+        let startup_deadline = Instant::now() + Duration::from_secs(grace_secs);
 
         info!(
             "startup grace period: {} s (init={:?})",
@@ -125,6 +129,7 @@ impl Daemon {
             sched_latency_ns_available,
             preempt_switchable,
             last_power_source: None,
+            last_pressure_level: PressureLevel::Normal,
         })
     }
 
@@ -132,11 +137,16 @@ impl Daemon {
     // Entry-point
     // -----------------------------------------------------------------------
 
-    pub async fn run(
+    /// Run the main event loop until `Event::Shutdown` is received.
+    ///
+    /// `initial_power` is the power state read synchronously at spawn time
+    /// by `sched::spawn_power_monitor` (before this call), so the correct
+    /// scheduling profile can be applied immediately at startup rather than
+    /// waiting for the first `Event::Power`.
+    pub fn run(
         mut self,
-        mut proc_monitor: ProcMonitor,
-        mut control_rx:   tokio::sync::mpsc::Receiver<ControlCommand>,
-        mut shutdown:     ShutdownToken,
+        event_rx: std::sync::mpsc::Receiver<Event>,
+        initial_power: PowerState,
     ) -> Result<()> {
         // Disable autogroup (single highest-impact kernel toggle).
         let _autogroup_guard = if !self.config.sched.autogroup_enabled {
@@ -145,14 +155,8 @@ impl Daemon {
             None
         };
 
-        // PSI monitor.
-        let psi_config = self.config.pressure;
-        let mut psi_rx = spawn_psi_monitor(psi_config);
-        let mut last_pressure_level = PressureLevel::Normal;
-
-        // Power state monitor.
-        let mut power_rx = monitor_power_state().await;
-        let initial_power = *power_rx.borrow();
+        // Apply the scheduling profile matching the power state observed at
+        // startup.
         self.last_power_source = Some(initial_power);
         let profile = if initial_power == PowerState::Battery {
             &CONSERVATIVE
@@ -161,20 +165,9 @@ impl Daemon {
         };
         apply_sched_profile(profile, self.sched_latency_ns_available, self.preempt_switchable);
 
-        // Timers.
-        let rescan_interval = Duration::from_secs(self.config.daemon.rescan_interval_secs);
-        let mut rescan_timer = time::interval(rescan_interval);
-        rescan_timer.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-
-        let mut gc_timer = time::interval(Duration::from_secs(10));
-        gc_timer.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-
-        let mut recheck_timer = time::interval(Duration::from_secs(5));
-        recheck_timer.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-
         // Initial scan.
         if self.config.daemon.apply_to_existing_processes {
-            self.do_full_scan().await;
+            self.do_full_scan();
         }
 
         // Startup grace period is already configured in Daemon::new()
@@ -185,70 +178,49 @@ impl Daemon {
 
         info!("event loop started");
 
-        loop {
+        for event in event_rx.iter() {
             // End of startup grace period — enable classification.
-            if self.startup_phase && tokio::time::Instant::now() >= self.startup_deadline {
+            if self.startup_phase && Instant::now() >= self.startup_deadline {
                 info!("startup grace period ended; enabling full classification");
                 self.startup_phase = false;
-                self.do_full_scan().await;
+                self.do_full_scan();
             }
-            tokio::select! {
-                // Netlink proc event.
-                event = proc_monitor.next_event() => {
-                    match event {
-                        Some(e) => {
-                            if self.startup_phase {
-                                // During the grace period we still drain the
-                                // channel so the 4096-slot buffer never fills
-                                // and stalls the listener thread (which causes
-                                // the kernel to drop events, including future
-                                // Exits).  Process Exits for bookkeeping only;
-                                // full classification happens after the grace
-                                // period via do_full_scan().
-                                self.handle_proc_event_startup(e).await;
-                            } else {
-                                self.handle_proc_event(e).await;
-                            }
-                        }
-                        None    => {
-                            warn!("netlink proc monitor closed — stopping");
-                            break;
-                        }
+
+            match event {
+                Event::Proc(e) => {
+                    if self.startup_phase {
+                        // During the grace period we still drain proc
+                        // events so classification stays deferred but
+                        // bookkeeping (fork-bomb tracking, table inserts,
+                        // Exit cleanup) doesn't fall behind.
+                        self.handle_proc_event_startup(e);
+                    } else {
+                        self.handle_proc_event(e);
                     }
                 }
 
-                // Control socket command.
-                cmd = control_rx.recv() => {
-                    match cmd {
-                        Some(c) => self.handle_control_cmd(c).await,
-                        None    => {}
-                    }
-                }
+                Event::Control(cmd) => self.handle_control_cmd(cmd),
 
-                // PSI update.
-                _ = psi_rx.changed() => {
-                    let pressure = *psi_rx.borrow();
-                    self.state.lock().await.pressure = pressure;
+                Event::Pressure(pressure) => {
+                    self.state.lock().unwrap().pressure = pressure;
                     let level = PressureLevel::from_memory(
                         &pressure.memory,
-                        psi_config.memory_low_threshold,
-                        psi_config.memory_high_threshold,
+                        self.config.pressure.memory_low_threshold,
+                        self.config.pressure.memory_high_threshold,
                     );
-                    if level != last_pressure_level {
-                        info!("pressure level: {:?} → {:?}", last_pressure_level, level);
+                    if level != self.last_pressure_level {
+                        info!("pressure level: {:?} → {:?}", self.last_pressure_level, level);
                         diag!("PSI",
                             "level={:?} mem_avg10={:.2} io_avg10={:.2} cpu_avg10={:.2}",
                             level, pressure.memory.some_avg10,
                             pressure.io.some_avg10, pressure.cpu.some_avg10
                         );
-                        last_pressure_level = level;
-                        self.handle_pressure_change(level).await;
+                        self.last_pressure_level = level;
+                        self.handle_pressure_change(level);
                     }
                 }
 
-                // Power state change.
-                _ = power_rx.changed() => {
-                    let new_source = *power_rx.borrow_and_update();
+                Event::Power(new_source) => {
                     if self.last_power_source != Some(new_source) {
                         let prev = self.last_power_source.replace(new_source);
                         if let Some(p) = prev {
@@ -267,31 +239,25 @@ impl Daemon {
                     }
                 }
 
-                // Periodic full rescan.
-                _ = rescan_timer.tick() => {
+                Event::RescanTick => {
                     debug!("periodic rescan");
-                    self.do_full_scan().await;
+                    self.do_full_scan();
                 }
 
-                // Recheck timer.
-                _ = recheck_timer.tick() => {
-                    self.do_rechecks().await;
-                }
+                Event::RecheckTick => self.do_rechecks(),
 
-                // GC timer.
-                _ = gc_timer.tick() => {
-                    self.do_gc();
-                }
+                Event::GcTick => self.do_gc(),
 
-                // Graceful shutdown signal.
-                _ = shutdown.wait() => {
+                Event::ReloadRules => self.reload_rules(),
+
+                Event::Shutdown => {
                     info!("shutdown signal received");
                     break;
                 }
             }
         }
 
-        self.shutdown().await;
+        self.shutdown();
         Ok(())
     }
 
@@ -304,7 +270,7 @@ impl Daemon {
     /// dropped Exit events.  Only Exit events need real processing — Fork
     /// events are ignored (the subsequent full scan will pick up survivors)
     /// and Exec/Comm/Uid events are deferred to post-grace classification.
-    async fn handle_proc_event_startup(&mut self, event: ProcEvent) {
+    fn handle_proc_event_startup(&mut self, event: ProcEvent) {
         match event {
             ProcEvent::Fork { parent_pid, child_pid, child_tgid } => {
                 diag!("FORK(startup)", "parent={} child={} tgid={}", parent_pid, child_pid, child_tgid);
@@ -312,8 +278,7 @@ impl Daemon {
                 if child_pid == child_tgid {
                     if let Some(ppid) = self.forkbomb.record_fork(parent_pid) {
                         let count = self.forkbomb
-                            .throttle_subtree(ppid, &self.table, &self.cgmgr)
-                            .await;
+                            .throttle_subtree(ppid, &self.table, &self.cgmgr);
                         debug!("startup fork-bomb: ppid={} throttled {} pids", ppid, count);
                     }
                 }
@@ -332,7 +297,7 @@ impl Daemon {
                 // Remove from managed even though classification is deferred —
                 // a previous daemon instance or a pre-existing classified entry
                 // could be in the map.
-                self.state.lock().await.managed.remove(&pid);
+                self.state.lock().unwrap().managed.remove(&pid);
             }
 
             // Exec/Comm/Uid during startup: just insert into the table so we
@@ -357,15 +322,14 @@ impl Daemon {
     // Proc events
     // -----------------------------------------------------------------------
 
-    async fn handle_proc_event(&mut self, event: ProcEvent) {
+    fn handle_proc_event(&mut self, event: ProcEvent) {
         match event {
             ProcEvent::Fork { parent_pid, child_pid, child_tgid } => {
                 diag!("FORK", "parent={} child={} tgid={}", parent_pid, child_pid, child_tgid);
                 if child_pid == child_tgid {
                     if let Some(ppid) = self.forkbomb.record_fork(parent_pid) {
                         let count = self.forkbomb
-                            .throttle_subtree(ppid, &self.table, &self.cgmgr)
-                            .await;
+                            .throttle_subtree(ppid, &self.table, &self.cgmgr);
                         warn!("fork bomb: ppid={} throttled {} pids", ppid, count);
                         return;
                     }
@@ -396,7 +360,7 @@ impl Daemon {
                         // goes through the rule engine fresh.
                         self.table.insert(info.clone());
                         if !self.startup_phase {
-                            self.classify_and_apply(pid, info).await;
+                            self.classify_and_apply(pid, info);
                         } else {
                             debug!("startup phase: defer classification for pid {}", pid);
                         }
@@ -409,7 +373,7 @@ impl Daemon {
                 diag!("EXIT", "pid={}", pid);
                 self.focus.on_exit(pid);
                 self.table.remove(pid);
-                self.state.lock().await.managed.remove(&pid);
+                self.state.lock().unwrap().managed.remove(&pid);
             }
 
             ProcEvent::Comm { pid, .. } | ProcEvent::Uid { pid } => {
@@ -424,7 +388,7 @@ impl Daemon {
                         Ok(info) => {
                             self.table.insert(info.clone());
                             if !self.startup_phase {
-                                self.classify_and_apply(pid, info).await;
+                                self.classify_and_apply(pid, info);
                             } else {
                                 debug!("startup phase: defer classification for pid {}", pid);
                             }
@@ -440,7 +404,7 @@ impl Daemon {
     // Control socket commands
     // -----------------------------------------------------------------------
 
-    async fn handle_control_cmd(&mut self, cmd: ControlCommand) {
+    fn handle_control_cmd(&mut self, cmd: ControlCommand) {
         match cmd {
             ControlCommand::SetForegroundProcess(pid) => {
                 if self.startup_phase {
@@ -448,35 +412,46 @@ impl Daemon {
                     return;
                 }
                 info!("foreground pid → {}", pid);
-                self.state.lock().await.foreground_pid = Some(pid);
-                self.focus.set_foreground(pid, &self.table, &self.cgmgr).await;
+                self.state.lock().unwrap().foreground_pid = Some(pid);
+                self.focus.set_foreground(pid, &self.table, &self.cgmgr);
             }
 
             ControlCommand::SetProcessCgroup { pid, cgroup } => {
                 if let Some(tier) = CgroupTier::from_str(&cgroup) {
-                    if let Err(e) = self.cgmgr.assign_pid(Some(tier), pid).await {
+                    if let Err(e) = self.cgmgr.assign_pid(Some(tier), pid) {
                         warn!("control SetProcessCgroup pid={} cgroup={}: {}", pid, cgroup, e);
                     }
                 }
             }
 
-            ControlCommand::ReloadRules => {
-                match self.engine.reload(&self.config.daemon.rules_dir) {
-                    Ok(_)  => info!("rules reloaded"),
-                    Err(e) => warn!("rules reload failed: {}", e),
-                }
-            }
+            ControlCommand::ReloadRules => self.reload_rules(),
         }
     }
 
-    async fn classify_and_apply(&mut self, pid: u32, mut info: ProcessInfo) {
+    fn reload_rules(&mut self) {
+        match self.engine.reload(&self.config.daemon.rules_dir) {
+            Ok(_)  => info!("rules reloaded"),
+            Err(e) => warn!("rules reload failed: {}", e),
+        }
+    }
+
+    fn classify_and_apply(&mut self, pid: u32, mut info: ProcessInfo) {
         // Never classify our own process or its threads — we'd be moving
         // ourselves, which changes our own scheduling in undefined ways.
+        // Netlink fork events fire for plain std::thread spawns too (they're
+        // clone() under the hood), so every dedicated OS thread name this
+        // daemon uses needs to be listed here, not just the process's own
+        // comm. (Previously just "tokio-rt-worker" + "procmon-netlink" — the
+        // tokio worker thread is gone, but this migration added several more
+        // named threads that need the same guard.)
         let own_pid = std::process::id();
+        const OWN_THREAD_NAMES: &[&str] = &[
+            "ulatencyd", "procmon-netlink", "psi-monitor", "power-monitor",
+            "signals", "control-socket", "control-sock-perm", "diag-log",
+            "cgroup-gc", "cgroup-teardown", "shutdown-restore",
+        ];
         if pid == own_pid || info.ppid == own_pid as u32
-            || info.comm == "tokio-rt-worker"
-            || info.comm == "procmon-netlink"
-            || info.comm == "ulatencyd"
+            || OWN_THREAD_NAMES.contains(&info.comm.as_str())
         {
             self.table.mark_classified(pid);
             return;
@@ -527,7 +502,7 @@ impl Daemon {
                     action.nice, action.sched_policy, action.oom_score_adj
                 );
 
-                let _ok = apply_action(pid, &action, &self.cgmgr).await;
+                let _ok = apply_action(pid, &action, &self.cgmgr);
 
                 if action.apply_to_children {
                     let children: Vec<u32> = self.table.children_of(pid).collect();
@@ -535,7 +510,7 @@ impl Daemon {
                         pid, info.comm, children.len());
                     for child in children {
                         if self.table.get(child).is_some() {
-                            apply_cgroup_only(child, &action, &self.cgmgr).await;
+                            apply_cgroup_only(child, &action, &self.cgmgr);
                         }
                     }
                 }
@@ -543,7 +518,7 @@ impl Daemon {
                 self.table.set_applied(pid, action);
 
                 {
-                    let mut state = self.state.lock().await;
+                    let mut state = self.state.lock().unwrap();
                     state.managed.insert(pid, ProcessEntry {
                         pid,
                         comm:      info.comm.clone(),
@@ -569,13 +544,15 @@ impl Daemon {
     // Full scan
     // -----------------------------------------------------------------------
 
-    async fn do_full_scan(&mut self) {
+    fn do_full_scan(&mut self) {
+        // Previously offloaded to tokio::task::spawn_blocking to avoid
+        // stalling the single-threaded async runtime's other select! arms
+        // while the /proc walk ran. With no async runtime, this is just a
+        // plain synchronous call — other event producers (procmon, control
+        // socket, PSI, timers) keep queuing into event_rx regardless of how
+        // long this takes, so nothing is lost, only delayed.
         let known_pids = self.table.known_pids();
-        let scan_result = tokio::task::spawn_blocking(move || {
-            procmon::scan_proc_incremental(&known_pids)
-        })
-            .await
-            .unwrap_or_else(|_| procmon::ScanResult::default());
+        let scan_result = procmon::scan_proc_incremental(&known_pids);
 
         let new_count = scan_result.new_processes.len();
         let live_pids = scan_result.live_pids.clone();
@@ -601,7 +578,7 @@ impl Daemon {
         // dropped (netlink backpressure, kernel buffer overflow) the entry
         // would leak forever without this sweep.
         {
-            let mut state = self.state.lock().await;
+            let mut state = self.state.lock().unwrap();
             let before = state.managed.len();
             state.managed.retain(|pid, _| live_pids.contains(pid));
             let removed = before - state.managed.len();
@@ -613,7 +590,7 @@ impl Daemon {
         if !self.startup_phase {
             for pid in unclassified {
                 if let Some(proc_info) = self.table.get(pid).map(|e| e.info.clone()) {
-                    self.classify_and_apply(pid, proc_info).await;
+                    self.classify_and_apply(pid, proc_info);
                 }
             }
         } else {
@@ -628,7 +605,7 @@ impl Daemon {
     // Recheck
     // -----------------------------------------------------------------------
 
-    async fn do_rechecks(&mut self) {
+    fn do_rechecks(&mut self) {
         let expired = self.table.expired_rechecks();
         for pid in expired {
             // Do not re-insert or re-classify processes that the focus tracker
@@ -645,13 +622,13 @@ impl Daemon {
             match ProcessInfo::from_pid(pid) {
                 Ok(proc_info) => {
                     self.table.insert(proc_info.clone());
-                    self.classify_and_apply(pid, proc_info).await;
+                    self.classify_and_apply(pid, proc_info);
                 }
                 Err(_) => {
                     // Remove from both stores so the managed map doesn't
                     // accumulate ghost entries for dead processes.
                     self.table.remove(pid);
-                    self.state.lock().await.managed.remove(&pid);
+                    self.state.lock().unwrap().managed.remove(&pid);
                 }
             }
         }
@@ -670,30 +647,30 @@ impl Daemon {
     // Pressure response
     // -----------------------------------------------------------------------
 
-    async fn handle_pressure_change(&mut self, level: PressureLevel) {
+    fn handle_pressure_change(&mut self, level: PressureLevel) {
         match level {
             PressureLevel::Critical => {
                 info!("critical memory pressure: throttling background/idle → swapstorm");
-                self.state.lock().await.mode = "pressure-critical".into();
+                self.state.lock().unwrap().mode = "pressure-critical".into();
                 // Move idle and background tier contents to swapstorm tier
                 // which has memory.max=128M and memory.swap.max=0 — prevents
                 // OOM cascade from swap exhaustion.
-                let idle_pids = self.cgmgr.tier_cgroup(cgroupv2::CgroupTier::Idle).pids().await.unwrap_or_default();
-                let bg_pids   = self.cgmgr.tier_cgroup(cgroupv2::CgroupTier::Background).pids().await.unwrap_or_default();
+                let idle_pids = self.cgmgr.tier_cgroup(cgroupv2::CgroupTier::Idle).pids().unwrap_or_default();
+                let bg_pids   = self.cgmgr.tier_cgroup(cgroupv2::CgroupTier::Background).pids().unwrap_or_default();
                 for pid in idle_pids.into_iter().chain(bg_pids) {
-                    let _ = self.cgmgr.assign_pid(Some(cgroupv2::CgroupTier::Swapstorm), pid).await;
+                    let _ = self.cgmgr.assign_pid(Some(cgroupv2::CgroupTier::Swapstorm), pid);
                 }
             }
             PressureLevel::High => {
-                self.state.lock().await.mode = "pressure-high".into();
+                self.state.lock().unwrap().mode = "pressure-high".into();
                 info!("high memory pressure: background processes may be throttled");
             }
             PressureLevel::Low => {
-                self.state.lock().await.mode = "pressure-low".into();
+                self.state.lock().unwrap().mode = "pressure-low".into();
             }
             PressureLevel::Normal => {
-                let was_critical = self.state.lock().await.mode == "pressure-critical";
-                self.state.lock().await.mode = "normal".into();
+                let was_critical = self.state.lock().unwrap().mode == "pressure-critical";
+                self.state.lock().unwrap().mode = "normal".into();
                 if was_critical {
                     // Pressure resolved — trigger rescan to restore processes
                     // to their correct tiers based on current rules.
@@ -701,7 +678,7 @@ impl Daemon {
                     // Reset classified flags on swapstorm pids so next rescan reclassifies them.
                     let swapstorm_pids = self.cgmgr
                         .tier_cgroup(cgroupv2::CgroupTier::Swapstorm)
-                        .pids().await.unwrap_or_default();
+                        .pids().unwrap_or_default();
                     for pid in swapstorm_pids {
                         self.table.mark_classified_false(pid);
                     }
@@ -714,15 +691,20 @@ impl Daemon {
     // Shutdown
     // -----------------------------------------------------------------------
 
-    async fn shutdown(&self) {
+    fn shutdown(&self) {
         info!("shutdown: restoring process cgroups");
         crate::diag::diag_section("SHUTDOWN");
 
         let moved = self.table.moved_pids();
 
-        let restore_result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            async {
+        // Cap the whole restore pass at 2s, same as before. There's no
+        // async runtime to hand a future to tokio::time::timeout anymore,
+        // so run the restore loop on its own thread and wait for it with
+        // recv_timeout — the same pattern cgroupv2::teardown uses.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let restore_thread = std::thread::Builder::new()
+            .name("shutdown-restore".into())
+            .spawn(move || {
                 let mut n = 0usize;
                 for (pid, original) in &moved {
                     let Some(ref orig_path) = original else { continue; };
@@ -734,24 +716,32 @@ impl Daemon {
                         debug!("teardown: original cgroup gone for pid {}: {}", pid, orig_path);
                         continue;
                     }
-                    crate::applier::restore_cgroup(*pid, orig_path).await;
+                    crate::applier::restore_cgroup(*pid, orig_path);
                     n += 1;
                 }
-                n
+                let _ = tx.send((n, moved.len()));
+            });
+
+        let restored = if restore_thread.is_ok() {
+            match rx.recv_timeout(Duration::from_secs(2)) {
+                Ok((n, total)) => Some((n, total)),
+                Err(_) => {
+                    info!("teardown: restore timed out");
+                    None
+                }
             }
-        ).await;
+        } else {
+            None
+        };
 
-        let restored = restore_result.unwrap_or_else(|_| {
-            info!("teardown: restore timed out");
-            0
-        });
-
-        if !moved.is_empty() {
-            info!("teardown: restored {}/{} pids", restored, moved.len());
+        if let Some((restored, total)) = restored {
+            if total > 0 {
+                info!("teardown: restored {}/{} pids", restored, total);
+            }
         }
 
-        self.cgmgr.teardown().await;
-        crate::diag::flush_diagnostic_log().await;
+        self.cgmgr.teardown();
+        crate::diag::flush_diagnostic_log();
         info!("shutdown complete");
     }
 }

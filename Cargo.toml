@@ -10,12 +10,6 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-# Only the tokio features actually used anywhere in the main workspace —
-# confirmed by grepping tokio:: call sites. No "net" (nothing calls
-# tokio::net directly; procmon's netlink socket is a raw libc socket on its
-# own std::thread). No "rt-multi-thread" (the daemon runs
-# #[tokio::main(flavor = "current_thread")]).
-tokio = { version = "1", features = ["fs", "io-util", "macros", "rt", "signal", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_derive = "1"
@@ -23,12 +17,13 @@ anyhow = "1"
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-toml = "0.7"
 nix = { version = "0.27", features = ["signal", "process", "fs", "sched", "resource"] }
 libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 wildmatch = "2"
 itoa = "1"
-async-trait = "0.1"
+# Drives the daemon's own SIGTERM/SIGINT/SIGHUP thread (crates/core/src/signal.rs)
+# now that there's no tokio runtime to provide tokio::signal::unix.
+signal-hook = "0.3"
 varlink = "13"
 varlink_generator = "13"

@@ -1,4 +1,4 @@
-//! Configuration loaded from /etc/ulatencyd/ulatencyd.toml
+//! Configuration loaded from /etc/ulatencyd/ulatencyd.json
 
 use std::path::PathBuf;
 use anyhow::{Context, Result};
@@ -62,6 +62,7 @@ impl Default for DaemonConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct CgroupsConfig {
     /// Override the cgroup root path on non-systemd systems.
+    #[serde(default)]
     pub cgroup_root: Option<PathBuf>,
 }
 
@@ -116,7 +117,7 @@ impl Config {
     pub fn load(path: &std::path::Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("read config {}", path.display()))?;
-        toml::from_str(&text)
+        serde_json::from_str(&text)
             .with_context(|| format!("parse config {}", path.display()))
     }
 

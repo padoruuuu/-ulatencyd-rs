@@ -1,0 +1,75 @@
+{
+  "rule": [
+    {
+      "name": "compositor",
+      "priority": 80,
+      "match": {
+        "comm": [
+          "sway",
+          "kwin_wayland",
+          "kwin_x11",
+          "mutter",
+          "weston",
+          "gamescope",
+          "Hyprland",
+          "river",
+          "wayfire",
+          "labwc",
+          "openbox",
+          "i3",
+          "bspwm",
+          "herbstluftwm",
+          "qtile",
+          "awesome",
+          "xmonad",
+          "dwm",
+          "spectrwm",
+          "fluxbox",
+          "jwm",
+          "icewm",
+          "Xorg",
+          "X",
+          "Xwayland"
+        ]
+      },
+      "action": {
+        "oom_score_adj": -1000
+      },
+      "note": "File: named overrides for processes whose default classification is wrong. The rule engine classifies ALL processes by default (uid>0 in user session -> interactive; uid>0 user service -> system; uid=0 / system service -> system) \u2014 this file only needs entries that need DIFFERENT treatment from that default, or oom_score_adj protection. Compositors/WMs would default to interactive (correct tier) but must NOT be moved (cgroup managed by logind), so only oom is set here."
+    },
+    {
+      "name": "display-manager",
+      "priority": 75,
+      "match": {
+        "comm": [
+          "sddm",
+          "gdm",
+          "gdm3",
+          "lightdm",
+          "greetd",
+          "lxdm",
+          "ly-dm"
+        ]
+      },
+      "action": {
+        "oom_score_adj": -1000
+      },
+      "note": "Display managers default to system tier (fine); just needs OOM protection."
+    },
+    {
+      "name": "dbus",
+      "priority": 70,
+      "match": {
+        "comm": [
+          "dbus-broker",
+          "dbus-broker-lau",
+          "dbus-daemon"
+        ]
+      },
+      "action": {
+        "oom_score_adj": -500
+      },
+      "note": "D-Bus must stay in its own scope (no cgroup move); protect from OOM."
+    }
+  ]
+}

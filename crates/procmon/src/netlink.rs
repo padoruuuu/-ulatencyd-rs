@@ -1,15 +1,15 @@
 //! Linux netlink proc connector (CN_IDX_PROC) listener.
 //!
 //! Opens a NETLINK_CONNECTOR socket, subscribes to proc events, and streams
-//! them through a tokio channel. The socket is owned by a blocking background
-//! thread; a `ProcMonitor` is the async handle.
+//! them through a std::sync::mpsc channel. The socket is owned by a
+//! blocking background thread; a `ProcMonitor` is the receiving handle.
 //!
 //! Kernel headers referenced:
 //!   <linux/netlink.h>, <linux/connector.h>, <linux/cn_proc.h>
 
 use std::os::unix::io::RawFd;
+use std::sync::mpsc;
 use anyhow::{bail, Result};
-use tokio::sync::mpsc;
 use tracing::{debug, error};
 
 
@@ -114,7 +114,7 @@ pub enum ProcEvent {
     Uid  { pid: u32 },
 }
 
-/// Async handle to the background netlink listener thread.
+/// Handle to the background netlink listener thread.
 pub struct ProcMonitor {
     rx: mpsc::Receiver<ProcEvent>,
 }
@@ -125,7 +125,10 @@ impl ProcMonitor {
         let fd = open_connector_socket()?;
         subscribe_to_proc_events(fd)?;
 
-        let (tx, rx) = mpsc::channel::<ProcEvent>(4096);
+        // Bounded, matching the old tokio channel's capacity — the sender
+        // (the netlink listener thread) blocks on send() if the receiver
+        // falls behind, which is the same backpressure behaviour as before.
+        let (tx, rx) = mpsc::sync_channel::<ProcEvent>(4096);
 
         std::thread::Builder::new()
             .name("procmon-netlink".into())
@@ -134,9 +137,10 @@ impl ProcMonitor {
         Ok(Self { rx })
     }
 
-    /// Receive the next proc event (async).
-    pub async fn next_event(&mut self) -> Option<ProcEvent> {
-        self.rx.recv().await
+    /// Block until the next proc event arrives, or `None` if the listener
+    /// thread has exited (socket closed / error).
+    pub fn next_event(&mut self) -> Option<ProcEvent> {
+        self.rx.recv().ok()
     }
 }
 
@@ -246,7 +250,7 @@ fn subscribe_to_proc_events(fd: RawFd) -> Result<()> {
 // Listener loop (runs in a background OS thread)
 // ---------------------------------------------------------------------------
 
-fn run_listener(fd: RawFd, tx: mpsc::Sender<ProcEvent>) {
+fn run_listener(fd: RawFd, tx: mpsc::SyncSender<ProcEvent>) {
     let mut buf = vec![0u8; 8192];
 
     loop {
@@ -275,7 +279,7 @@ fn run_listener(fd: RawFd, tx: mpsc::Sender<ProcEvent>) {
             if nlh.nlmsg_type == libc::NLMSG_DONE as u16 {
                 let cn_off = offset + std::mem::size_of::<libc::nlmsghdr>();
                 if let Some(event) = parse_cn_msg(&data[cn_off..]) {
-                    if tx.blocking_send(event).is_err() {
+                    if tx.send(event).is_err() {
                         debug!("procmon: receiver dropped, exiting listener");
                         unsafe { libc::close(fd); }
                         return;

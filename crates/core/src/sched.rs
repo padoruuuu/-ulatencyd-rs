@@ -260,28 +260,42 @@ pub fn detect_power_state_sysfs() -> PowerState {
     }
 }
 
-/// Monitor power state by polling sysfs every 5 seconds.
-/// Returns a watch receiver of PowerState.
+/// Monitor power state by polling sysfs every 5 seconds, on a dedicated
+/// thread. Returns an `Arc<Mutex<PowerState>>` holding the latest known
+/// state (readable at any time without waiting for a change), and pushes
+/// `Event::Power(new_state)` into `event_tx` whenever the state actually
+/// changes.
 ///
 /// 5s (rather than the previous D-Bus fallback's 30s) keeps AC↔battery
 /// transitions reasonably prompt now that sysfs polling is the *only*
 /// detection path rather than a rarely-used fallback.
-pub async fn monitor_power_state() -> tokio::sync::watch::Receiver<PowerState> {
+pub fn spawn_power_monitor(
+    event_tx: std::sync::mpsc::Sender<crate::event::Event>,
+) -> std::sync::Arc<std::sync::Mutex<PowerState>> {
     let initial = detect_power_state_sysfs();
-    let (tx, rx) = tokio::sync::watch::channel(initial);
+    let latest = std::sync::Arc::new(std::sync::Mutex::new(initial));
+    let latest_for_thread = latest.clone();
 
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            let new_state = detect_power_state_sysfs();
-            // Only send when the state actually changed; sending the same
-            // value every tick would mark the watch as modified and cause
-            // the daemon's power handler to fire spuriously.
-            if *tx.borrow() != new_state {
-                if tx.send(new_state).is_err() { break; }
+    std::thread::Builder::new()
+        .name("power-monitor".into())
+        .spawn(move || {
+            let mut last = initial;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let new_state = detect_power_state_sysfs();
+                // Only send when the state actually changed; sending the
+                // same value every tick would fire the daemon's power
+                // handler spuriously.
+                if new_state != last {
+                    last = new_state;
+                    *latest_for_thread.lock().unwrap() = new_state;
+                    if event_tx.send(crate::event::Event::Power(new_state)).is_err() {
+                        return; // daemon shutting down
+                    }
+                }
             }
-        }
-    });
+        })
+        .expect("failed to spawn power-monitor thread");
 
-    rx
+    latest
 }

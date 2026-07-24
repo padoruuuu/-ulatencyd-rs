@@ -15,21 +15,18 @@ procmon   = { path = "../procmon" }
 cgroupv2  = { path = "../cgroupv2" }
 psi       = { path = "../psi" }
 rules     = { path = "../rules" }
-tokio     = { workspace = true }
 anyhow    = { workspace = true }
 thiserror = { workspace = true }
 tracing   = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde     = { workspace = true }
-toml      = { workspace = true }
 libc      = { workspace = true }
 nix       = { workspace = true }
 clap      = { workspace = true }
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
-# Required by the async-mode varlink-generated bindings (see
-# crates/control-proto/README.md) — the generated code uses these directly
-# even though nothing in this crate calls them by name.
-varlink        = { workspace = true, features = ["tokio"] }
-async-trait    = { workspace = true }
+signal-hook = { workspace = true }
+# Sync mode now (see crates/control-proto/README.md) — the control socket
+# runs a blocking varlink::listen() server on its own thread, matching
+# crates/cli, so no "tokio" feature is needed here anymore.
+varlink        = { workspace = true }
 serde_derive   = { workspace = true }
 serde_json     = { workspace = true }

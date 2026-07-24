@@ -10,62 +10,45 @@ use libc;
 use cgroupv2::{CgroupManager, CgroupTier};
 use rules::Action;
 
-pub async fn apply_action(pid: u32, action: &Action, cgmgr: &CgroupManager) -> bool {
+pub fn apply_action(pid: u32, action: &Action, cgmgr: &CgroupManager) -> bool {
     let mut ok = true;
 
-    ok &= apply_cgroup_inner(pid, action, cgmgr).await;
+    ok &= apply_cgroup_inner(pid, action, cgmgr);
 
-    // set_nice / set_sched_policy / set_oom_score_adj are all synchronous
-    // syscalls/file writes. On the multi-thread runtime this was merely
-    // wasteful; on the current_thread runtime main.rs now uses, blocking the
-    // single worker thread here would stall the entire event loop (netlink
-    // events, PSI updates, control-socket requests) for the duration of all
-    // three calls. Bundle them into one spawn_blocking so the async task
-    // yields instead of blocking in place.
-    let nice          = action.nice;
-    let sched_policy  = action.sched_policy.clone();
-    let sched_priority = action.sched_priority;
-    let oom_score_adj = action.oom_score_adj;
+    // set_nice / set_sched_policy / set_oom_score_adj are plain syscalls /
+    // file writes. Under tokio these were bundled into a single
+    // spawn_blocking so they wouldn't stall the single-threaded async
+    // runtime. With no async runtime at all, that protection is
+    // unnecessary — this is a net simplification, not just parity: we now
+    // just call the three syscalls directly, inline, synchronously, on
+    // whatever thread is doing classification.
+    if let Some(nice) = action.nice {
+        match set_nice(pid, nice) {
+            Ok(_)  => debug!("pid {} nice={}", pid, nice),
+            Err(e) => { debug!("pid {} nice={}: {}", pid, nice, e); ok = false; }
+        }
+    }
 
-    if nice.is_some() || sched_policy.is_some() || oom_score_adj.is_some() {
-        let applied = tokio::task::spawn_blocking(move || {
-            let mut ok = true;
+    if let Some(ref policy) = action.sched_policy {
+        let prio = action.sched_priority.unwrap_or(0);
+        match set_sched_policy(pid, policy, prio) {
+            Ok(_)  => debug!("pid {} sched={}/{}", pid, policy, prio),
+            Err(e) => { debug!("pid {} sched={}: {}", pid, policy, e); ok = false; }
+        }
+    }
 
-            if let Some(nice) = nice {
-                match set_nice(pid, nice) {
-                    Ok(_)  => debug!("pid {} nice={}", pid, nice),
-                    Err(e) => { debug!("pid {} nice={}: {}", pid, nice, e); ok = false; }
-                }
-            }
-
-            if let Some(ref policy) = sched_policy {
-                let prio = sched_priority.unwrap_or(0);
-                match set_sched_policy(pid, policy, prio) {
-                    Ok(_)  => debug!("pid {} sched={}/{}", pid, policy, prio),
-                    Err(e) => { debug!("pid {} sched={}: {}", pid, policy, e); ok = false; }
-                }
-            }
-
-            if let Some(adj) = oom_score_adj {
-                match set_oom_score_adj(pid, adj) {
-                    Ok(_)  => debug!("pid {} oom_score_adj={}", pid, adj),
-                    Err(e) => { debug!("pid {} oom={}: {}", pid, adj, e); ok = false; }
-                }
-            }
-
-            ok
-        })
-        .await
-        .unwrap_or(false);
-
-        ok &= applied;
+    if let Some(adj) = action.oom_score_adj {
+        match set_oom_score_adj(pid, adj) {
+            Ok(_)  => debug!("pid {} oom_score_adj={}", pid, adj),
+            Err(e) => { debug!("pid {} oom={}: {}", pid, adj, e); ok = false; }
+        }
     }
 
     ok
 }
 
-pub async fn apply_cgroup_only(pid: u32, action: &Action, cgmgr: &CgroupManager) -> bool {
-    apply_cgroup_inner(pid, action, cgmgr).await
+pub fn apply_cgroup_only(pid: u32, action: &Action, cgmgr: &CgroupManager) -> bool {
+    apply_cgroup_inner(pid, action, cgmgr)
 }
 
 /// Read the current cgroup v2 path for pid from /proc/pid/cgroup.
@@ -80,22 +63,22 @@ pub fn read_current_cgroup(pid: u32) -> Option<String> {
     None
 }
 
-async fn apply_cgroup_inner(pid: u32, action: &Action, cgmgr: &CgroupManager) -> bool {
+fn apply_cgroup_inner(pid: u32, action: &Action, cgmgr: &CgroupManager) -> bool {
     let Some(ref name) = action.cgroup else { return true; };
     let Some(tier) = CgroupTier::from_str(name) else {
         warn!("unknown cgroup tier {:?} for pid {}", name, pid);
         return false;
     };
-    match cgmgr.assign_pid(Some(tier), pid).await {
+    match cgmgr.assign_pid(Some(tier), pid) {
         Ok(_)  => { debug!("pid {} → cgroup/{}", pid, name); true }
         Err(e) => { debug!("pid {} → cgroup/{}: {}", pid, name, e); false }
     }
 }
 
 /// Move a PID back to an arbitrary cgroup path (used in teardown).
-pub async fn restore_cgroup(pid: u32, cgroup_path: &str) {
+pub fn restore_cgroup(pid: u32, cgroup_path: &str) {
     let procs_path = format!("/sys/fs/cgroup{}/cgroup.procs", cgroup_path);
-    if let Err(e) = tokio::fs::write(&procs_path, format!("{}\n", pid)).await {
+    if let Err(e) = std::fs::write(&procs_path, format!("{}\n", pid)) {
         debug!("restore pid {} to {}: {}", pid, cgroup_path, e);
     }
 }

@@ -1,0 +1,29 @@
+{
+  "daemon": {
+    "log_level": "info",
+    "pid_file": "/run/ulatencyd.pid",
+    "rules_dir": ["/etc/ulatencyd/rules", "/usr/lib/ulatencyd/rules"],
+    "rescan_interval_secs": 30,
+    "apply_to_existing_processes": true
+  },
+  "cgroups": {
+  },
+  "pressure": {
+    "memory_low_threshold": 5.0,
+    "memory_high_threshold": 40.0,
+    "check_interval_ms": 3000
+  },
+  "fork_bomb": {
+    "threshold_per_second": 150,
+    "lineage_depth": 5
+  },
+  "sched": {
+    "autogroup_enabled": false,
+    "detect_and_defer": true
+  },
+  "control_socket": {
+    "enabled": true,
+    "path": "/run/ulatencyd/control.sock",
+    "group": "ulatencyd"
+  }
+}

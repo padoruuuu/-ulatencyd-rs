@@ -15,7 +15,7 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use anyhow::{Context, Result};
-use tokio::fs;
+use std::fs;
 use tracing::{debug, info, warn};
 
 /// Inode of /proc/self/ns/cgroup, cached at first call.
@@ -56,22 +56,20 @@ impl Cgroup {
         self.path.join(name)
     }
 
-    async fn write(&self, name: &str, value: &str) -> Result<()> {
+    fn write(&self, name: &str, value: &str) -> Result<()> {
         let path = self.file(name);
         fs::write(&path, value)
-            .await
             .with_context(|| format!("write {} = {:?}", path.display(), value))
     }
 
     /// Write PID to cgroup.procs (assigns the process to this cgroup).
-    pub async fn assign_pid(&self, pid: u32) -> Result<()> {
-        self.write("cgroup.procs", &format!("{}\n", pid)).await
+    pub fn assign_pid(&self, pid: u32) -> Result<()> {
+        self.write("cgroup.procs", &format!("{}\n", pid))
     }
 
     /// List all PIDs currently in this cgroup.
-    pub async fn pids(&self) -> Result<Vec<u32>> {
+    pub fn pids(&self) -> Result<Vec<u32>> {
         let content = fs::read_to_string(self.file("cgroup.procs"))
-            .await
             .with_context(|| format!("read {}/cgroup.procs", self.path.display()))?;
         Ok(content
             .lines()
@@ -80,39 +78,39 @@ impl Cgroup {
     }
 
     /// Kill all processes in this cgroup atomically (requires kernel 5.14+).
-    pub async fn kill_all(&self) -> Result<()> {
-        self.write("cgroup.kill", "1").await
+    pub fn kill_all(&self) -> Result<()> {
+        self.write("cgroup.kill", "1")
     }
 
     // --- resource knobs ---
 
-    pub async fn set_cpu_weight(&self, weight: u32) -> Result<()> {
-        self.write("cpu.weight", &format!("{}\n", weight.clamp(1, 10_000))).await
+    pub fn set_cpu_weight(&self, weight: u32) -> Result<()> {
+        self.write("cpu.weight", &format!("{}\n", weight.clamp(1, 10_000)))
     }
 
-    pub async fn set_cpu_max(&self, quota_us: u64, period_us: u64) -> Result<()> {
-        self.write("cpu.max", &format!("{} {}\n", quota_us, period_us)).await
+    pub fn set_cpu_max(&self, quota_us: u64, period_us: u64) -> Result<()> {
+        self.write("cpu.max", &format!("{} {}\n", quota_us, period_us))
     }
 
-    pub async fn set_memory_high(&self, bytes: u64) -> Result<()> {
-        self.write("memory.high", &format!("{}\n", bytes)).await
+    pub fn set_memory_high(&self, bytes: u64) -> Result<()> {
+        self.write("memory.high", &format!("{}\n", bytes))
     }
 
-    pub async fn set_memory_max(&self, bytes: u64) -> Result<()> {
-        self.write("memory.max", &format!("{}\n", bytes)).await
+    pub fn set_memory_max(&self, bytes: u64) -> Result<()> {
+        self.write("memory.max", &format!("{}\n", bytes))
     }
 
-    pub async fn set_memory_swap_max(&self, bytes: u64) -> Result<()> {
+    pub fn set_memory_swap_max(&self, bytes: u64) -> Result<()> {
         // "0" disables swap for this cgroup.
-        self.write("memory.swap.max", &format!("{}\n", bytes)).await
+        self.write("memory.swap.max", &format!("{}\n", bytes))
     }
 
-    pub async fn set_io_weight(&self, weight: u32) -> Result<()> {
-        self.write("io.weight", &format!("{}\n", weight.clamp(1, 10_000))).await
+    pub fn set_io_weight(&self, weight: u32) -> Result<()> {
+        self.write("io.weight", &format!("{}\n", weight.clamp(1, 10_000)))
     }
 
-    pub async fn set_oom_group(&self, enable: bool) -> Result<()> {
-        self.write("memory.oom.group", if enable { "1\n" } else { "0\n" }).await
+    pub fn set_oom_group(&self, enable: bool) -> Result<()> {
+        self.write("memory.oom.group", if enable { "1\n" } else { "0\n" })
     }
 }
 
@@ -169,13 +167,13 @@ pub struct CgroupManager {
 impl CgroupManager {
     /// Initialise the manager, creating the cgroup hierarchy from scratch.
     /// Call after init-system-specific root setup.
-    pub async fn new(root: PathBuf) -> Result<Self> {
+    pub fn new(root: PathBuf) -> Result<Self> {
         let mut mgr = Self {
             root,
             controllers: Vec::new(),
             sched_ext_active: detect_sched_ext(),
         };
-        mgr.setup_hierarchy().await?;
+        mgr.setup_hierarchy()?;
         Ok(mgr)
     }
 
@@ -195,7 +193,7 @@ impl CgroupManager {
     /// Silently skips processes that are in a different cgroup namespace
     /// (e.g. inside a bwrap/container sandbox) — moving them would either
     /// fail with EINVAL or break their sandbox.
-    pub async fn assign_pid(&self, tier: Option<CgroupTier>, pid: u32) -> Result<()> {
+    pub fn assign_pid(&self, tier: Option<CgroupTier>, pid: u32) -> Result<()> {
         if !same_cgroup_ns(pid) {
             debug!("skipping pid {} — different cgroup namespace (sandboxed)", pid);
             return Ok(());
@@ -204,7 +202,7 @@ impl CgroupManager {
             Some(t) => self.tier_cgroup(t),
             None    => self.root_cgroup(),
         };
-        cgroup.assign_pid(pid).await
+        cgroup.assign_pid(pid)
     }
 
     /// Garbage-collect empty child cgroups (non-blocking, spawns a task).
@@ -212,23 +210,29 @@ impl CgroupManager {
     /// We leave occupied tiers alone — they are rebuilt on the next setup_hierarchy().
     pub fn gc_empty_cgroups(&self) {
         let root = self.root.clone();
-        tokio::spawn(async move {
-            for tier in all_tiers() {
-                let cg = Cgroup { path: root.join(tier.dir_name()) };
-                match cg.pids().await {
-                    Ok(pids) if pids.is_empty() => {
-                        // Bug 4 fix: actually remove the empty directory instead
-                        // of only logging it.  remove_dir() is a no-op if the
-                        // cgroup doesn't exist or isn't empty.
-                        match fs::remove_dir(&cg.path).await {
-                            Ok(_)  => debug!("gc: removed empty cgroup {}", cg.path.display()),
-                            Err(e) => debug!("gc: could not remove {}: {}", cg.path.display(), e),
+        // Was tokio::spawn — a plain detached OS thread gives the same
+        // non-blocking-to-the-caller behaviour without a runtime. These are
+        // cheap syscalls; the thread exits on its own once done.
+        std::thread::Builder::new()
+            .name("cgroup-gc".into())
+            .spawn(move || {
+                for tier in all_tiers() {
+                    let cg = Cgroup { path: root.join(tier.dir_name()) };
+                    match cg.pids() {
+                        Ok(pids) if pids.is_empty() => {
+                            // Bug 4 fix: actually remove the empty directory instead
+                            // of only logging it.  remove_dir() is a no-op if the
+                            // cgroup doesn't exist or isn't empty.
+                            match fs::remove_dir(&cg.path) {
+                                Ok(_)  => debug!("gc: removed empty cgroup {}", cg.path.display()),
+                                Err(e) => debug!("gc: could not remove {}: {}", cg.path.display(), e),
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
-            }
-        });
+            })
+            .expect("failed to spawn cgroup-gc thread");
     }
 
     /// Shutdown cleanup.
@@ -239,13 +243,27 @@ impl CgroupManager {
     ///
     /// Each rmdir is capped at 100 ms; occupied cgroups are silently left in
     /// place — the kernel removes them automatically once the last process exits.
-    pub async fn teardown(&self) {
+    pub fn teardown(&self) {
         for tier in all_tiers() {
             let path = self.root.join(tier.dir_name());
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                fs::remove_dir(&path),
-            ).await {
+            // std::fs::remove_dir has no built-in timeout, so run it on its
+            // own thread and cap how long we wait for the result. In
+            // practice rmdir on an empty/missing dir returns instantly; this
+            // guards against the (very unlikely) case of it wedging on a
+            // weird filesystem during shutdown.
+            let (tx, rx) = std::sync::mpsc::channel();
+            let remove_path = path.clone();
+            let spawned = std::thread::Builder::new()
+                .name("cgroup-teardown".into())
+                .spawn(move || {
+                    let result = fs::remove_dir(&remove_path);
+                    let _ = tx.send(result);
+                });
+            if spawned.is_err() {
+                debug!("teardown: could not spawn helper thread for {}", path.display());
+                continue;
+            }
+            match rx.recv_timeout(std::time::Duration::from_millis(100)) {
                 Ok(Ok(_))  => debug!("teardown: removed {}", path.display()),
                 Ok(Err(e)) => debug!("teardown: {} occupied or missing: {}", path.display(), e),
                 Err(_)     => debug!("teardown: {} timed out", path.display()),
@@ -257,9 +275,9 @@ impl CgroupManager {
     // Internal
     // -----------------------------------------------------------------------
 
-    async fn setup_hierarchy(&mut self) -> Result<()> {
+    fn setup_hierarchy(&mut self) -> Result<()> {
         // Detect available controllers.
-        let avail = self.read_available_controllers().await;
+        let avail = self.read_available_controllers();
         self.controllers = avail;
 
         // Enable controllers in our root's subtree_control.
@@ -272,7 +290,7 @@ impl CgroupManager {
         if !wanted.is_empty() {
             let value = wanted.iter().map(|c| format!("+{}", c)).collect::<Vec<_>>().join(" ");
             let sc_path = self.root.join("cgroup.subtree_control");
-            if let Err(e) = fs::write(&sc_path, &value).await {
+            if let Err(e) = fs::write(&sc_path, &value) {
                 warn!("set subtree_control {:?}: {}", value, e);
             } else {
                 info!("enabled controllers: {}", value);
@@ -280,12 +298,12 @@ impl CgroupManager {
         }
 
         // Create tier directories and configure them.
-        self.create_and_configure_tiers().await?;
+        self.create_and_configure_tiers()?;
 
         Ok(())
     }
 
-    async fn create_and_configure_tiers(&self) -> Result<()> {
+    fn create_and_configure_tiers(&self) -> Result<()> {
         // TODO(cgroupv2-future): Upcoming kernel interfaces worth adopting:
         //
         // 1. cpu.idle (kernel 6.4+, stable): Writing `1` makes an entire cgroup
@@ -324,7 +342,7 @@ impl CgroupManager {
             let dir = self.root.join(tier.dir_name());
             if !dir.exists() {
                 fs::create_dir(&dir)
-                    .await
+                    
                     .with_context(|| format!("create cgroup dir {}", dir.display()))?;
             }
             let cg = Cgroup { path: dir };
@@ -333,50 +351,50 @@ impl CgroupManager {
             match tier {
                 CgroupTier::Rt => {
                     if !self.sched_ext_active {
-                        let _ = cg.set_cpu_weight(9000).await;
+                        let _ = cg.set_cpu_weight(9000);
                     }
-                    let _ = cg.set_io_weight(9000).await;
-                    let _ = cg.set_oom_group(true).await;
+                    let _ = cg.set_io_weight(9000);
+                    let _ = cg.set_oom_group(true);
                 }
                 CgroupTier::Interactive => {
                     if !self.sched_ext_active {
-                        let _ = cg.set_cpu_weight(5000).await;
+                        let _ = cg.set_cpu_weight(5000);
                     }
                 }
                 CgroupTier::System => {
                     if !self.sched_ext_active {
-                        let _ = cg.set_cpu_weight(2000).await;
+                        let _ = cg.set_cpu_weight(2000);
                     }
                 }
                 CgroupTier::Background => {
                     if !self.sched_ext_active {
-                        let _ = cg.set_cpu_weight(500).await;
+                        let _ = cg.set_cpu_weight(500);
                     }
-                    let _ = cg.set_io_weight(100).await;
+                    let _ = cg.set_io_weight(100);
                 }
                 CgroupTier::Idle => {
                     if !self.sched_ext_active {
-                        let _ = cg.set_cpu_weight(100).await;
+                        let _ = cg.set_cpu_weight(100);
                     }
-                    let _ = cg.set_memory_high(256 * 1024 * 1024).await;
+                    let _ = cg.set_memory_high(256 * 1024 * 1024);
                 }
                 CgroupTier::Swapstorm => {
                     if !self.sched_ext_active {
-                        let _ = cg.set_cpu_weight(50).await;
+                        let _ = cg.set_cpu_weight(50);
                     }
-                    let _ = cg.set_memory_max(128 * 1024 * 1024).await;
-                    let _ = cg.set_memory_swap_max(0).await;
-                    let _ = cg.set_oom_group(true).await;
+                    let _ = cg.set_memory_max(128 * 1024 * 1024);
+                    let _ = cg.set_memory_swap_max(0);
+                    let _ = cg.set_oom_group(true);
                 }
             }
         }
         Ok(())
     }
 
-    async fn read_available_controllers(&self) -> Vec<String> {
+    fn read_available_controllers(&self) -> Vec<String> {
         let path = self.root.join("cgroup.controllers");
         fs::read_to_string(&path)
-            .await
+            
             .unwrap_or_default()
             .split_whitespace()
             .map(|s| s.to_string())
@@ -393,10 +411,10 @@ impl CgroupManager {
 /// system's session manager (elogind/systemd-logind). Writing to it disrupts
 /// their cgroup delegation and causes elogind to crash on runit systems.
 /// Controllers are enabled in our own subtree by CgroupManager::setup_hierarchy.
-pub async fn setup_direct_root() -> Result<PathBuf> {
+pub fn setup_direct_root() -> Result<PathBuf> {
     let root = PathBuf::from("/sys/fs/cgroup/ulatencyd");
     fs::create_dir_all(&root)
-        .await
+        
         .with_context(|| format!("create {}", root.display()))?;
     Ok(root)
 }

@@ -1,77 +1,45 @@
-//! Unix signal handling via tokio.
+//! Unix signal handling via signal-hook, on a dedicated OS thread.
 //!
-//! Provides a ShutdownToken (SIGTERM/SIGINT) and a SIGHUP reload channel.
+//! SIGTERM/SIGINT map to `Event::Shutdown`; SIGHUP maps to `Event::ReloadRules`.
+//! There is no separate forwarding step: the signal thread pushes directly
+//! onto the daemon's single fan-in event channel.
 
-use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::{mpsc, watch};
+use std::sync::mpsc::Sender;
+
+use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
 use tracing::info;
 
-// ---------------------------------------------------------------------------
-// ShutdownToken
-// ---------------------------------------------------------------------------
+use crate::event::Event;
 
-/// A cloneable token that becomes ready when SIGTERM or SIGINT is received.
-#[derive(Clone)]
-pub struct ShutdownToken {
-    rx: watch::Receiver<bool>,
-}
+/// Spawn a background thread that listens for SIGTERM, SIGINT, and SIGHUP
+/// and pushes the corresponding `Event` onto `tx`.
+pub fn init_signals(tx: Sender<Event>) -> anyhow::Result<()> {
+    let mut signals = Signals::new([SIGTERM, SIGINT, SIGHUP])?;
 
-impl ShutdownToken {
-    /// Wait until shutdown is signalled.
-    pub async fn wait(&mut self) {
-        let _ = self.rx.wait_for(|&v| v).await;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Public initialiser
-// ---------------------------------------------------------------------------
-
-/// Spawn background tasks for SIGTERM, SIGINT, and SIGHUP.
-///
-/// Returns:
-///   - `ShutdownToken` — becomes ready on SIGTERM or SIGINT
-///   - `mpsc::Receiver<()>` — fires on SIGHUP (reload requests)
-pub fn init_signals() -> (ShutdownToken, mpsc::Receiver<()>) {
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let (sighup_tx,   sighup_rx)   = mpsc::channel::<()>(4);
-
-    // SIGTERM
-    tokio::spawn({
-        let tx = shutdown_tx.clone();
-        async move {
-            let mut sig = signal(SignalKind::terminate())
-                .expect("failed to register SIGTERM handler");
-            sig.recv().await;
-            info!("received SIGTERM");
-            let _ = tx.send(true);
-        }
-    });
-
-    // SIGINT
-    tokio::spawn({
-        let tx = shutdown_tx;
-        async move {
-            let mut sig = signal(SignalKind::interrupt())
-                .expect("failed to register SIGINT handler");
-            sig.recv().await;
-            info!("received SIGINT");
-            let _ = tx.send(true);
-        }
-    });
-
-    // SIGHUP (reload)
-    tokio::spawn(async move {
-        let mut sig = signal(SignalKind::hangup())
-            .expect("failed to register SIGHUP handler");
-        loop {
-            sig.recv().await;
-            info!("received SIGHUP — reloading rules");
-            if sighup_tx.send(()).await.is_err() {
-                break;
+    std::thread::Builder::new()
+        .name("signals".into())
+        .spawn(move || {
+            for sig in signals.forever() {
+                let ev = match sig {
+                    SIGHUP => {
+                        info!("received SIGHUP — reloading rules");
+                        Event::ReloadRules
+                    }
+                    SIGTERM => {
+                        info!("received SIGTERM");
+                        Event::Shutdown
+                    }
+                    _ /* SIGINT */ => {
+                        info!("received SIGINT");
+                        Event::Shutdown
+                    }
+                };
+                if tx.send(ev).is_err() {
+                    return; // main loop has exited
+                }
             }
-        }
-    });
+        })?;
 
-    (ShutdownToken { rx: shutdown_rx }, sighup_rx)
+    Ok(())
 }

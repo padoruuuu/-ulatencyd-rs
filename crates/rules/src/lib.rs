@@ -44,6 +44,14 @@ struct RuleToml {
     action:   ActionToml,
     #[serde(default)]
     r#continue: bool,
+    /// Free-form documentation string, e.g. explaining *why* a rule exists.
+    /// Deliberately accepted (not covered by `deny_unknown_fields`) and
+    /// otherwise unused — JSON has no comment syntax, so this is the
+    /// escape hatch for the load-bearing explanatory comments the old
+    /// TOML rule files relied on.
+    #[serde(default)]
+    #[allow(dead_code)]
+    note: Option<String>,
 }
 
 fn default_priority() -> i32 { 50 }
@@ -90,6 +98,10 @@ pub struct ActionToml {
     pub io_weight:           Option<u32>,
     pub recheck_secs:        Option<u64>,
     pub apply_to_children:   Option<bool>,
+    /// Free-form documentation string; see `RuleToml::note`.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub note: Option<String>,
 }
 
 /// A [[profile]] block (used for inheritance).
@@ -426,7 +438,7 @@ fn load_rules(dirs: &[PathBuf]) -> Result<Vec<Rule>> {
         let mut entries: Vec<_> = std::fs::read_dir(dir)
             .with_context(|| format!("read rules dir {}", dir.display()))?
             .flatten()
-            .filter(|e| e.path().extension().map_or(false, |x| x == "toml"))
+            .filter(|e| e.path().extension().map_or(false, |x| x == "json"))
             .collect();
         entries.sort_by_key(|e| e.file_name());
 
@@ -434,7 +446,7 @@ fn load_rules(dirs: &[PathBuf]) -> Result<Vec<Rule>> {
             let path = entry.path();
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("read rule file {}", path.display()))?;
-            let rf: RuleFile = toml::from_str(&text)
+            let rf: RuleFile = serde_json::from_str(&text)
                 .with_context(|| format!("parse rule file {}", path.display()))?;
 
             // Register profiles first (build inheritance map).

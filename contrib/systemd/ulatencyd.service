@@ -42,7 +42,7 @@ ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=yes
 RuntimeDirectory=ulatencyd
-# 0750: only root and the control_socket.group members (see ulatencyd.toml)
+# 0750: only root and the control_socket.group members (see ulatencyd.json)
 # can reach into /run/ulatencyd to find control.sock. ulatencyd itself
 # re-chowns/chmods the directory and socket at startup (crates/core/src/
 # control.rs) — this is just a sane starting permission for the window

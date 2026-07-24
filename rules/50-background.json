@@ -1,0 +1,231 @@
+{
+  "rule": [
+    {
+      "name": "package-manager-system",
+      "priority": 70,
+      "match": {
+        "comm": [
+          "pacman",
+          "apt",
+          "apt-get",
+          "dpkg",
+          "dnf",
+          "yum",
+          "zypper",
+          "emerge",
+          "xbps-install",
+          "apk",
+          "pip",
+          "pip3",
+          "npm",
+          "yarn",
+          "paru",
+          "yay",
+          "aura",
+          "trizen",
+          "pikaur"
+        ],
+        "uid_max": 999
+      },
+      "action": {
+        "cgroup": "background",
+        "nice": 15,
+        "io_weight": 50,
+        "sched_policy": "batch",
+        "oom_score_adj": 300
+      },
+      "note": "File: background and idle process throttling. IMPORTANT: rules using sched_policy=idle or batch are restricted to uid_max=999 (system service accounts) \u2014 these policies only run a process when nothing else wants the CPU, which is safe for system maintenance tasks but will stall user session processes that happen to call the same tools (find, grep, etc. in XFCE/KDE init scripts). For user-initiated builds/tools (uid>=1000), nice levels alone are used instead, which throttle without starvation. Package managers and build tools are each split into a *-system rule (SCHED_IDLE/batch, uid_max=999) and a *-user rule (nice only, uid_min=1000)."
+    },
+    {
+      "name": "package-manager-user",
+      "priority": 69,
+      "match": {
+        "comm": [
+          "pacman",
+          "apt",
+          "apt-get",
+          "dpkg",
+          "dnf",
+          "yum",
+          "zypper",
+          "emerge",
+          "xbps-install",
+          "apk",
+          "pip",
+          "pip3",
+          "npm",
+          "yarn",
+          "paru",
+          "yay",
+          "aura",
+          "trizen",
+          "pikaur"
+        ],
+        "uid_min": 1000
+      },
+      "action": {
+        "cgroup": "background",
+        "nice": 10,
+        "io_weight": 50,
+        "oom_score_adj": 300
+      }
+    },
+    {
+      "name": "build-tools-system",
+      "priority": 65,
+      "match": {
+        "comm": [
+          "make",
+          "cmake",
+          "ninja",
+          "meson",
+          "cargo",
+          "rustc",
+          "gcc",
+          "g++",
+          "cc",
+          "c++",
+          "clang",
+          "clang++",
+          "ld",
+          "lld",
+          "mold",
+          "gold",
+          "ar",
+          "ranlib",
+          "go",
+          "javac",
+          "mvn",
+          "gradle",
+          "ant",
+          "webpack",
+          "rollup",
+          "vite",
+          "tsc",
+          "cc1",
+          "cc1plus",
+          "collect2"
+        ],
+        "uid_max": 999
+      },
+      "action": {
+        "cgroup": "background",
+        "nice": 15,
+        "io_weight": 50,
+        "sched_policy": "batch"
+      }
+    },
+    {
+      "name": "build-tools-user",
+      "priority": 64,
+      "match": {
+        "comm": [
+          "make",
+          "cmake",
+          "ninja",
+          "meson",
+          "cargo",
+          "rustc",
+          "gcc",
+          "g++",
+          "cc",
+          "c++",
+          "clang",
+          "clang++",
+          "ld",
+          "lld",
+          "mold",
+          "gold",
+          "ar",
+          "ranlib",
+          "go",
+          "javac",
+          "mvn",
+          "gradle",
+          "ant",
+          "webpack",
+          "rollup",
+          "vite",
+          "tsc",
+          "cc1",
+          "cc1plus",
+          "collect2"
+        ],
+        "uid_min": 1000
+      },
+      "action": {
+        "cgroup": "background",
+        "nice": 10,
+        "io_weight": 50
+      }
+    },
+    {
+      "name": "disk-intensive-system",
+      "priority": 45,
+      "match": {
+        "comm": [
+          "find",
+          "grep",
+          "locate",
+          "mlocate",
+          "plocate",
+          "fd",
+          "rg",
+          "ripgrep",
+          "updatedb",
+          "rsync",
+          "rclone",
+          "borg",
+          "restic",
+          "duplicati",
+          "fsck",
+          "e2fsck",
+          "xfs_repair",
+          "btrfs",
+          "dd",
+          "pv",
+          "tar",
+          "gzip",
+          "bzip2",
+          "xz",
+          "zstd",
+          "mkfs",
+          "mkfs.ext4",
+          "mkfs.xfs",
+          "mkfs.btrfs"
+        ],
+        "uid_max": 999
+      },
+      "action": {
+        "cgroup": "idle",
+        "nice": 19,
+        "io_weight": 10,
+        "sched_policy": "idle"
+      },
+      "note": "Disk-intensive system maintenance \u2014 ONLY for system users. find/grep/locate are also used by session startup scripts (XFCE, KDE, etc.), so SCHED_IDLE must NOT be applied to uid>=1000 or session services stall \u2014 see the disk-intensive-user rule below for the uid>=1000 case (nice throttle only, no starvation policy)."
+    },
+    {
+      "name": "disk-intensive-user",
+      "priority": 44,
+      "match": {
+        "comm": [
+          "rsync",
+          "rclone",
+          "borg",
+          "restic",
+          "tar",
+          "gzip",
+          "bzip2",
+          "xz",
+          "zstd"
+        ],
+        "uid_min": 1000
+      },
+      "action": {
+        "cgroup": "background",
+        "nice": 15,
+        "io_weight": 30
+      }
+    }
+  ]
+}

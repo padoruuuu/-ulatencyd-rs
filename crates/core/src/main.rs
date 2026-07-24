@@ -8,6 +8,7 @@ mod config;
 mod control;
 mod daemon;
 mod diag;
+mod event;
 mod focus;
 mod forkbomb;
 mod init;
@@ -16,11 +17,11 @@ mod sched;
 mod signal;
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::sync::mpsc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tokio::sync::Mutex;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -28,11 +29,11 @@ use cgroupv2::CgroupManager;
 use procmon::ProcMonitor;
 
 use config::Config;
-use control::{ControlCommand, SharedState, start_control_service};
+use control::{SharedState, start_control_service};
 use daemon::Daemon;
 use diag::flush_diagnostic_log;
+use event::Event;
 use init::{Supervisor, SupervisorNotify};
-use signal::init_signals;
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -46,7 +47,7 @@ use signal::init_signals;
 )]
 struct Args {
     /// Path to configuration file.
-    #[arg(short, long, default_value = "/etc/ulatencyd/ulatencyd.toml")]
+    #[arg(short, long, default_value = "/etc/ulatencyd/ulatencyd.json")]
     config: PathBuf,
 
     /// Override log level (trace|debug|info|warn|error).
@@ -64,12 +65,10 @@ struct Args {
 // main
 // ---------------------------------------------------------------------------
 
-// Nothing in the daemon needs true CPU parallelism — the event loop is a
-// single tokio::select! over I/O-bound sources, and cgroup/sysctl writes are
-// either quick or explicitly spawn_blocking'd.  A single-threaded runtime
-// avoids the overhead of the multi-thread scheduler and work-stealing queues.
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+// No async runtime: every event source below is a plain OS thread pushing
+// into one std::sync::mpsc::channel(), and main() itself just does startup
+// wiring and then hands off to Daemon::run()'s blocking receive loop.
+fn main() -> Result<()> {
     let args = Args::parse();
 
     // Load config (defaults if missing).
@@ -92,7 +91,7 @@ async fn main() -> Result<()> {
 
     // Diagnostic log (optional).
     if args.diagnostic {
-        match diag::init_diagnostic_log().await {
+        match diag::init_diagnostic_log() {
             Ok(path) => {
                 info!("diagnostic log: {}", path.display());
                 diag::diag_section("STARTUP");
@@ -125,11 +124,10 @@ async fn main() -> Result<()> {
     // cgroup that belongs to the session manager (elogind/systemd-logind).
     //
     // Same binary, same code path, works on all init systems.
-    let cgroup_root = setup_cgroup_root().await
+    let cgroup_root = setup_cgroup_root()
         .context("failed to set up cgroup root")?;
 
     let cgmgr = CgroupManager::new(cgroup_root)
-        .await
         .context("failed to initialise cgroup hierarchy")?;
 
     info!("cgroup hierarchy ready at {}", cgmgr.root.display());
@@ -137,48 +135,80 @@ async fn main() -> Result<()> {
     // Shared state (control socket + main loop).
     let state = Arc::new(Mutex::new(SharedState::new()));
 
-    // Control socket service.
-    let (control_rx, control_tx) = if config.control_socket.enabled {
-        match start_control_service(
+    // The single fan-in event channel. Every producer below gets its own
+    // cloned Sender<Event> and pushes into it from its own dedicated OS
+    // thread; Daemon::run() is a single blocking receive loop over the
+    // Receiver.
+    let (event_tx, event_rx) = mpsc::channel::<Event>();
+
+    // Control socket service — runs a blocking varlink server on its own
+    // thread and forwards commands as Event::Control(cmd).
+    if config.control_socket.enabled {
+        if let Err(e) = start_control_service(
             Arc::clone(&state),
             &config.control_socket.path,
             &config.control_socket.group,
-        ).await {
-            Ok((rx, tx)) => (rx, Some(tx)),
-            Err(e) => {
-                tracing::warn!("control socket failed to start: {} (continuing without)", e);
-                let (_, rx) = tokio::sync::mpsc::channel(1);
-                (rx, None)
-            }
+            event_tx.clone(),
+        ) {
+            tracing::warn!("control socket failed to start: {} (continuing without)", e);
         }
-    } else {
-        let (_, rx) = tokio::sync::mpsc::channel(1);
-        (rx, None)
-    };
+    }
 
-    // Netlink proc monitor.
-    let proc_monitor = ProcMonitor::spawn()
+    // Netlink proc monitor + a thread that forwards its events onto the
+    // shared channel as Event::Proc(e).
+    let mut proc_monitor = ProcMonitor::spawn()
         .context("failed to open netlink proc connector")?;
+    {
+        let tx = event_tx.clone();
+        std::thread::Builder::new()
+            .name("procmon-forward".into())
+            .spawn(move || {
+                while let Some(e) = proc_monitor.next_event() {
+                    if tx.send(Event::Proc(e)).is_err() {
+                        return; // daemon shutting down
+                    }
+                }
+                tracing::warn!("netlink proc monitor closed — requesting shutdown");
+                let _ = tx.send(Event::Shutdown);
+            })
+            .context("failed to spawn procmon-forward thread")?;
+    }
 
-    // Signals.
-    let (shutdown, mut sighup_rx) = init_signals();
+    // Signals: SIGHUP → Event::ReloadRules, SIGTERM/SIGINT → Event::Shutdown.
+    // Wired directly onto the same channel — no extra forwarding hop needed
+    // (the old tokio version routed SIGHUP through the control channel via
+    // an intermediate task; that indirection is gone).
+    signal::init_signals(event_tx.clone())
+        .context("failed to install signal handlers")?;
 
-    // Wire SIGHUP → rule reload directly onto the control channel, in-process,
-    // no socket round trip needed.
-    if let Some(tx) = control_tx {
-        tokio::spawn(async move {
-            while sighup_rx.recv().await.is_some() {
-                tracing::info!("SIGHUP received: reloading rules");
-                let _ = tx.send(ControlCommand::ReloadRules).await;
-            }
-        });
-    } else {
-        tokio::spawn(async move {
-            while sighup_rx.recv().await.is_some() {
-                tracing::warn!("SIGHUP received but control channel is unavailable; cannot reload");
-            }
+    // Timers — three trivial always-sleeping threads (rescan/recheck/gc).
+    // Matches the existing philosophy of many cheap, mostly-blocked threads
+    // rather than one clever multiplexed one.
+    spawn_ticker("rescan-timer", std::time::Duration::from_secs(config.daemon.rescan_interval_secs), event_tx.clone(), || Event::RescanTick);
+    spawn_ticker("recheck-timer", std::time::Duration::from_secs(5), event_tx.clone(), || Event::RecheckTick);
+    spawn_ticker("gc-timer", std::time::Duration::from_secs(10), event_tx.clone(), || Event::GcTick);
+
+    // PSI monitor — kernel-native reactive triggers on /proc/pressure/memory,
+    // with a timeout-driven fallback tick. psi has no dependency on this
+    // crate's Event type (core depends on psi, not the other way around),
+    // so it takes a plain callback instead. The returned Arc<Mutex<..>> is
+    // psi's own always-fresh copy for on-demand reads; unused here because
+    // on-demand queries (control socket / ulatencyctl pressure) already go
+    // through SharedState.pressure, which the daemon keeps in sync from
+    // every Event::Pressure it processes.
+    {
+        let tx = event_tx.clone();
+        let _pressure_state = psi::spawn_psi_monitor(config.pressure, move |p| {
+            tx.send(Event::Pressure(p)).is_ok()
         });
     }
+
+    // Power state monitor — sysfs polling on its own thread. The returned
+    // Arc<Mutex<PowerState>> already holds the value read synchronously at
+    // spawn time, so we can apply the correct scheduling profile immediately
+    // without waiting for the first Event::Power.
+    let power_state = sched::spawn_power_monitor(event_tx.clone());
+    let initial_power = *power_state.lock().unwrap();
 
     // Write PID file.
     write_pid_file(&config.daemon.pid_file);
@@ -188,16 +218,15 @@ async fn main() -> Result<()> {
 
     // Build and run the daemon.
     let daemon = Daemon::new(config, cgmgr, Arc::clone(&state), init_system)
-        .await
         .context("failed to initialise daemon")?;
 
     notify.ready();
     notify.status("running");
 
-    daemon.run(proc_monitor, control_rx, shutdown).await?;
+    daemon.run(event_rx, initial_power)?;
 
     notify.stopping();
-    flush_diagnostic_log().await;
+    flush_diagnostic_log();
     info!("exiting cleanly");
     Ok(())
 }
@@ -205,6 +234,29 @@ async fn main() -> Result<()> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Spawn a dedicated sleep-loop thread that pushes `make_event()` into `tx`
+/// every `interval`: `loop { sleep(interval); if tx.send(make_event()).is_err() { return } }`.
+/// Replaces `tokio::time::interval` — the equivalent of
+/// `MissedTickBehavior::Skip` falls out naturally here since a plain
+/// `sleep()` loop never queues up missed ticks the way a wall-clock-aligned
+/// interval can.
+fn spawn_ticker<F>(name: &'static str, interval: std::time::Duration, tx: mpsc::Sender<Event>, make_event: F)
+where
+    F: Fn() -> Event + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(interval);
+                if tx.send(make_event()).is_err() {
+                    return; // daemon shutting down
+                }
+            }
+        })
+        .expect("failed to spawn ticker thread");
+}
 
 /// Parse /proc/self/cgroup and return the delegated cgroupv2 path if one
 /// is present and exists on the filesystem.  Returns `None` if no `0::`
@@ -245,7 +297,7 @@ fn read_delegated_cgroup() -> Option<PathBuf> {
 /// root itself, which is owned by the session manager (elogind/systemd-logind).
 /// Writing our tier hierarchy there would interfere with their delegation.
 /// We fall back to creating `/sys/fs/cgroup/ulatencyd` directly instead.
-async fn setup_cgroup_root() -> Result<PathBuf> {
+fn setup_cgroup_root() -> Result<PathBuf> {
     // 1. Try the delegated cgroup from /proc/self/cgroup.
     if let Some(delegated) = read_delegated_cgroup() {
         if delegated != PathBuf::from("/sys/fs/cgroup") {
@@ -261,7 +313,7 @@ async fn setup_cgroup_root() -> Result<PathBuf> {
 
     // 2. Fallback: create /sys/fs/cgroup/ulatencyd directly.
     //    Works on runit, s6, OpenRC, and when run manually as root.
-    cgroupv2::setup_direct_root().await
+    cgroupv2::setup_direct_root()
 }
 
 fn write_pid_file(path: &std::path::Path) {

@@ -8,20 +8,30 @@
 //! directory (see `start_control_service` / §5 of the design notes), not
 //! polkit — polkit-gated D-Bus access lives only in the optional
 //! `contrib/system76-compat-shim` companion binary now.
+//!
+//! The server runs synchronously (`varlink::listen`, blocking worker
+//! threads) rather than on a tokio runtime. `ControlInterface` methods that
+//! need to signal the main loop send an `Event::Control(cmd)` onto the same
+//! `std::sync::mpsc::Sender<Event>` every other event source uses; none of
+//! the current commands need a synchronous reply value back from the main
+//! loop (they're accepted onto the channel and acknowledged immediately,
+//! matching the old D-Bus semantics exactly — see `reload_rules` below).
 
 use std::collections::HashMap;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
 use psi::SystemPressure;
 
+use crate::event::Event;
+
 // ---------------------------------------------------------------------------
-// Generated varlink bindings (async server mode)
+// Generated varlink bindings (sync server mode)
 // ---------------------------------------------------------------------------
 
 #[allow(non_camel_case_types, dead_code, non_snake_case)]
@@ -92,7 +102,7 @@ impl Default for SharedState {
 
 struct ControlInterface {
     state:  Arc<Mutex<SharedState>>,
-    cmd_tx: mpsc::Sender<ControlCommand>,
+    event_tx: Sender<Event>,
 }
 
 fn to_pressure_metrics(m: &psi::PsiMetrics) -> PressureMetrics {
@@ -106,10 +116,9 @@ fn to_pressure_metrics(m: &psi::PsiMetrics) -> PressureMetrics {
     }
 }
 
-#[async_trait::async_trait]
 impl VarlinkInterface for ControlInterface {
-    async fn status(&self, call: &mut dyn Call_Status) -> varlink::Result<()> {
-        let s = self.state.lock().await;
+    fn status(&self, call: &mut dyn Call_Status) -> varlink::Result<()> {
+        let s = self.state.lock().unwrap();
         call.reply(
             s.version.clone(),
             s.mode.clone(),
@@ -118,11 +127,11 @@ impl VarlinkInterface for ControlInterface {
         )
     }
 
-    async fn list_managed_processes(
+    fn list_managed_processes(
         &self,
         call: &mut dyn Call_ListManagedProcesses,
     ) -> varlink::Result<()> {
-        let s = self.state.lock().await;
+        let s = self.state.lock().unwrap();
         let processes = s
             .managed
             .values()
@@ -136,12 +145,12 @@ impl VarlinkInterface for ControlInterface {
         call.reply(processes)
     }
 
-    async fn get_process_info(
+    fn get_process_info(
         &self,
         call: &mut dyn Call_GetProcessInfo,
         pid: i64,
     ) -> varlink::Result<()> {
-        let s = self.state.lock().await;
+        let s = self.state.lock().unwrap();
         match s.managed.get(&(pid as u32)) {
             Some(e) => call.reply(ProcessRecord {
                 pid:    e.pid as i64,
@@ -153,11 +162,11 @@ impl VarlinkInterface for ControlInterface {
         }
     }
 
-    async fn get_system_pressure(
+    fn get_system_pressure(
         &self,
         call: &mut dyn Call_GetSystemPressure,
     ) -> varlink::Result<()> {
-        let p = self.state.lock().await.pressure;
+        let p = self.state.lock().unwrap().pressure;
         call.reply(
             to_pressure_metrics(&p.memory),
             to_pressure_metrics(&p.io),
@@ -165,36 +174,35 @@ impl VarlinkInterface for ControlInterface {
         )
     }
 
-    async fn reload_rules(&self, call: &mut dyn Call_ReloadRules) -> varlink::Result<()> {
+    fn reload_rules(&self, call: &mut dyn Call_ReloadRules) -> varlink::Result<()> {
         // A successful reply means "accepted onto the channel" — matching
         // prior D-Bus semantics exactly, not "operation completed". The
-        // main event loop's tokio::select! consumes this unchanged.
-        let _ = self.cmd_tx.send(ControlCommand::ReloadRules).await;
+        // main event loop's `for event in event_rx.iter()` consumes this
+        // unchanged.
+        let _ = self.event_tx.send(Event::Control(ControlCommand::ReloadRules));
         call.reply()
     }
 
-    async fn set_process_cgroup(
+    fn set_process_cgroup(
         &self,
         call: &mut dyn Call_SetProcessCgroup,
         pid: i64,
         cgroup: String,
     ) -> varlink::Result<()> {
         let _ = self
-            .cmd_tx
-            .send(ControlCommand::SetProcessCgroup { pid: pid as u32, cgroup })
-            .await;
+            .event_tx
+            .send(Event::Control(ControlCommand::SetProcessCgroup { pid: pid as u32, cgroup }));
         call.reply()
     }
 
-    async fn set_foreground_process(
+    fn set_foreground_process(
         &self,
         call: &mut dyn Call_SetForegroundProcess,
         pid: i64,
     ) -> varlink::Result<()> {
         let _ = self
-            .cmd_tx
-            .send(ControlCommand::SetForegroundProcess(pid as u32))
-            .await;
+            .event_tx
+            .send(Event::Control(ControlCommand::SetForegroundProcess(pid as u32)));
         call.reply()
     }
 }
@@ -306,22 +314,32 @@ fn prepare_socket_dir(socket_path: &Path, group: &str) -> Result<u32> {
 /// Poll for the socket file to appear on disk (varlink's listener creates it
 /// synchronously right after bind, but we don't get a callback), then
 /// chown/chmod it. Budget: ~1s at 20ms intervals.
+///
+/// This runs on its own thread rather than blocking `start_control_service`
+/// because `varlink::listen` (called right after this) blocks the calling
+/// thread for the lifetime of the server — the socket file doesn't exist
+/// yet at the moment we'd want to chown/chmod it if we did this inline
+/// before spawning the listener thread, so it has to happen concurrently
+/// with (or after) the listener creating it.
 fn spawn_socket_permission_fixup(socket_path: PathBuf, gid: u32) {
-    tokio::spawn(async move {
-        for _ in 0..50 {
-            if socket_path.exists() {
-                chown_path(&socket_path, gid);
-                chmod_path(&socket_path, 0o660);
-                debug!("control socket permissions set: {}", socket_path.display());
-                return;
+    std::thread::Builder::new()
+        .name("control-sock-perm".into())
+        .spawn(move || {
+            for _ in 0..50 {
+                if socket_path.exists() {
+                    chown_path(&socket_path, gid);
+                    chmod_path(&socket_path, 0o660);
+                    debug!("control socket permissions set: {}", socket_path.display());
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        warn!(
-            "control socket {} did not appear within 1s; permissions not set",
-            socket_path.display()
-        );
-    });
+            warn!(
+                "control socket {} did not appear within 1s; permissions not set",
+                socket_path.display()
+            );
+        })
+        .expect("failed to spawn control-sock-perm thread");
 }
 
 // ---------------------------------------------------------------------------
@@ -330,40 +348,48 @@ fn spawn_socket_permission_fixup(socket_path: PathBuf, gid: u32) {
 
 /// Start the control service on a Unix socket.
 ///
-/// Returns a command receiver for the main event loop to consume, plus a
-/// clone of the sender — used by `main.rs` to wire SIGHUP directly onto the
-/// same channel (`ControlCommand::ReloadRules`), in-process, with no socket
-/// round trip.
-pub async fn start_control_service(
+/// Spawns the blocking varlink server on its own dedicated thread (mirroring
+/// procmon's netlink thread) and wires its command callbacks directly onto
+/// `event_tx` — the same fan-in channel every other event source uses, via
+/// `Event::Control(cmd)`. `main.rs` also wires SIGHUP directly onto
+/// `Event::ReloadRules` on the very same channel, in-process, with no
+/// socket round trip.
+pub fn start_control_service(
     state:       Arc<Mutex<SharedState>>,
     socket_path: &Path,
     group:       &str,
-) -> Result<(mpsc::Receiver<ControlCommand>, mpsc::Sender<ControlCommand>)> {
-    let (cmd_tx, cmd_rx) = mpsc::channel::<ControlCommand>(64);
-
+    event_tx:    Sender<Event>,
+) -> Result<()> {
     let gid = prepare_socket_dir(socket_path, group)?;
     spawn_socket_permission_fixup(socket_path.to_path_buf(), gid);
 
     let iface = ControlInterface {
         state: Arc::clone(&state),
-        cmd_tx: cmd_tx.clone(),
+        event_tx,
     };
 
-    let handler = control_proto::new(Arc::new(iface));
+    let handler = control_proto::new(Box::new(iface));
+    let service = varlink::VarlinkService::new(
+        "org.ulatencyd",
+        "ulatencyd-rs control service",
+        env!("CARGO_PKG_VERSION"),
+        "https://github.com/ulatencyd/ulatencyd-rs",
+        vec![Box::new(handler)],
+    );
     let address = format!("unix:{}", socket_path.display());
 
-    tokio::spawn(async move {
-        if let Err(e) = varlink::listen_async(
-            Arc::new(handler),
-            &address,
-            &varlink::ListenAsyncConfig::default(),
-        )
-        .await
-        {
-            tracing::error!("control socket listener exited: {}", e);
-        }
-    });
+    std::thread::Builder::new()
+        .name("control-socket".into())
+        .spawn(move || {
+            if let Err(e) = varlink::listen(
+                service,
+                &address,
+                &varlink::ListenConfig::default(),
+            ) {
+                tracing::error!("control socket listener exited: {}", e);
+            }
+        })?;
 
     info!("control socket listening on {}", socket_path.display());
-    Ok((cmd_rx, cmd_tx))
+    Ok(())
 }

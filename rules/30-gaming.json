@@ -1,0 +1,89 @@
+{
+  "rule": [
+    {
+      "name": "steam",
+      "priority": 70,
+      "match": {
+        "comm": [
+          "steam",
+          "steam_osx",
+          "steamwebhelper"
+        ]
+      },
+      "action": {
+        "cgroup": "interactive",
+        "nice": -5
+      },
+      "note": "File: gaming-related processes."
+    },
+    {
+      "name": "gamescope-game",
+      "priority": 80,
+      "match": {
+        "parent_comm": [
+          "gamescope"
+        ]
+      },
+      "action": {
+        "cgroup": "rt",
+        "sched_policy": "fifo",
+        "sched_priority": 60
+      }
+    },
+    {
+      "name": "wine",
+      "priority": 65,
+      "match": {
+        "comm_prefix": [
+          "wine",
+          "wineserver",
+          "winedevice"
+        ]
+      },
+      "action": {
+        "cgroup": "interactive",
+        "nice": -5
+      }
+    },
+    {
+      "name": "lutris",
+      "priority": 60,
+      "match": {
+        "comm": [
+          "lutris"
+        ]
+      },
+      "action": {
+        "cgroup": "interactive"
+      }
+    },
+    {
+      "name": "heroic",
+      "priority": 60,
+      "match": {
+        "comm": [
+          "heroic",
+          "heroic-games-launcher"
+        ]
+      },
+      "action": {
+        "cgroup": "interactive"
+      }
+    },
+    {
+      "name": "mangohud",
+      "priority": 75,
+      "match": {
+        "comm": [
+          "MangoHud",
+          "mangohud"
+        ]
+      },
+      "action": {
+        "cgroup": "rt",
+        "sched_policy": "fifo",
+        "sched_priority": 20
+      }
+    }
+  ]
+}

@@ -1,0 +1,72 @@
+{
+  "rule": [
+    {
+      "name": "browsers",
+      "priority": 65,
+      "match": {
+        "comm": [
+          "firefox",
+          "firefox-bin",
+          "firefox-esr",
+          "firefox-developer-edition",
+          "librewolf",
+          "floorp",
+          "waterfox",
+          "iceweasel",
+          "chromium",
+          "chromium-browser",
+          "google-chrome",
+          "google-chrome-stable",
+          "brave",
+          "brave-browser",
+          "vivaldi-bin",
+          "opera",
+          "ungoogled-chromium"
+        ]
+      },
+      "action": {
+        "oom_score_adj": -300
+      },
+      "note": "File: overrides for apps that need special oom_score_adj protection. Cgroup placement is handled by the default classifier (uid>0 in user session -> interactive) \u2014 these rules only add OOM protection on top."
+    },
+    {
+      "name": "communication",
+      "priority": 60,
+      "match": {
+        "comm": [
+          "discord",
+          "vesktop",
+          "slack",
+          "teams",
+          "signal-desktop",
+          "telegram-desktop",
+          "element-desktop",
+          "nheko"
+        ]
+      },
+      "action": {
+        "oom_score_adj": -200
+      }
+    },
+    {
+      "name": "media",
+      "priority": 55,
+      "match": {
+        "comm": [
+          "mpv",
+          "vlc",
+          "celluloid",
+          "rhythmbox",
+          "lollypop",
+          "deadbeef",
+          "clementine",
+          "strawberry",
+          "spotify"
+        ]
+      },
+      "action": {
+        "oom_score_adj": -200
+      }
+    }
+  ]
+}

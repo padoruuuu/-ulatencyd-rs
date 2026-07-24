@@ -12,7 +12,6 @@
 
 use std::collections::HashSet;
 use tracing::{debug, info};
-use futures_util::future::join_all;
 use crate::applier::set_nice;
 
 use cgroupv2::{CgroupManager, CgroupTier};
@@ -76,7 +75,7 @@ impl ForegroundTracker {
         self.current_pids.contains(&pid)
     }
 
-    pub async fn set_foreground(
+    pub fn set_foreground(
         &mut self,
         hint_pid: u32,
         table:    &ProcessTable,
@@ -124,20 +123,15 @@ impl ForegroundTracker {
         // Demote previous foreground pids not in the new set.
         // Nice is restored to 0 (CFS normal). Cgroup move to System only
         // applies to processes we originally moved (not session-scoped ones).
-        // All cgroup writes are issued concurrently to avoid stalling the
-        // Tokio I/O pool when the old foreground tree was large.
+        // These are cheap per-PID syscalls; a plain sequential loop was
+        // never meaningfully slower than the old join_all concurrency here.
         let to_demote: Vec<u32> = self.current_pids
             .difference(&new_pids)
             .copied()
             .collect();
-        // set_nice is synchronous; fire it for all pids first, then
-        // issue all cgroup.procs writes in parallel via join_all.
-        let demote_futs: Vec<_> = to_demote.iter().map(|&pid| {
+        for &pid in &to_demote {
             let _ = set_nice(pid, 0);
-            cgmgr.assign_pid(Some(CgroupTier::System), pid)
-        }).collect();
-        for (pid, result) in to_demote.iter().zip(join_all(demote_futs).await) {
-            if let Err(e) = result {
+            if let Err(e) = cgmgr.assign_pid(Some(CgroupTier::System), pid) {
                 debug!("demote pid {}: {}", pid, e);
             }
         }
@@ -145,19 +139,14 @@ impl ForegroundTracker {
             debug!("demoted {} pids → system (nice=0)", to_demote.len());
         }
 
-        // Promote new foreground pids — parallelised.
+        // Promote new foreground pids.
         // Apply nice=-5 (same as system76-scheduler) regardless of whether
         // the cgroup move succeeds — session-scoped processes stay in their
         // session cgroup but still get the scheduling boost.
-        // Browsers routinely have 30–60+ processes; sequential writes stall
-        // the Tokio I/O pool during the transition, causing a visible freeze.
         let to_promote: Vec<u32> = new_pids.iter().copied().collect();
-        let promote_futs: Vec<_> = to_promote.iter().map(|&pid| {
+        for &pid in &to_promote {
             let _ = set_nice(pid, -5);
-            cgmgr.assign_pid(Some(CgroupTier::Interactive), pid)
-        }).collect();
-        for (pid, result) in to_promote.iter().zip(join_all(promote_futs).await) {
-            if let Err(e) = result {
+            if let Err(e) = cgmgr.assign_pid(Some(CgroupTier::Interactive), pid) {
                 debug!("promote pid {}: {}", pid, e);
             }
         }
